@@ -56,6 +56,26 @@ class AgentAvatarSelection {
   }
 }
 
+/// Renders an emoji on a solid [color] to the 512px PNG that creation uploads.
+Future<Uint8List?> renderEmojiAvatarPng(String emoji, int color) async {
+  // Export pixels, as desktop does: registry pictures are ordinary HTTPS
+  // media URLs, not client-specific SVG data URLs.
+  final recorder = ui.PictureRecorder();
+  final canvas = Canvas(recorder);
+  canvas.drawColor(Color(color), BlendMode.src);
+  final text = TextPainter(
+    text: TextSpan(text: emoji, style: const TextStyle(fontSize: 258)),
+    textDirection: TextDirection.ltr,
+  )..layout();
+  text.paint(canvas, Offset((512 - text.width) / 2, (512 - text.height) / 2));
+  final picture = recorder.endRecording();
+  final raster = await picture.toImage(512, 512);
+  final data = await raster.toByteData(format: ui.ImageByteFormat.png);
+  raster.dispose();
+  picture.dispose();
+  return data?.buffer.asUint8List();
+}
+
 /// Avatar preview with character, shared emoji, and image selection controls.
 class AgentAvatarPicker extends HookConsumerWidget {
   const AgentAvatarPicker({
@@ -104,35 +124,9 @@ class AgentAvatarPicker extends HookConsumerWidget {
     final locked = disabled || busy.value || cameraActive.value;
 
     Future<void> selectEmoji() async {
-      // Export pixels, as desktop does: registry pictures are ordinary HTTPS
-      // media URLs, not client-specific SVG data URLs.
-      final recorder = ui.PictureRecorder();
-      final canvas = Canvas(recorder);
-      canvas.drawColor(Color(color.value), BlendMode.src);
-      final text = TextPainter(
-        text: TextSpan(
-          text: emoji.value,
-          style: const TextStyle(fontSize: 258),
-        ),
-        textDirection: TextDirection.ltr,
-      )..layout();
-      text.paint(
-        canvas,
-        Offset((512 - text.width) / 2, (512 - text.height) / 2),
-      );
-      final picture = recorder.endRecording();
-      final raster = await picture.toImage(512, 512);
-      final data = await raster.toByteData(format: ui.ImageByteFormat.png);
-      raster.dispose();
-      picture.dispose();
+      final data = await renderEmojiAvatarPng(emoji.value, color.value);
       if (context.mounted && data != null) {
-        onChanged(
-          AgentAvatarSelection.emoji(
-            data.buffer.asUint8List(),
-            emoji.value,
-            color.value,
-          ),
-        );
+        onChanged(AgentAvatarSelection.emoji(data, emoji.value, color.value));
       }
     }
 
