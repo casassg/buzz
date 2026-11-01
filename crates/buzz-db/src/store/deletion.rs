@@ -78,6 +78,7 @@ pub const RELAY_ADMIN_TABLES: &[(&str, &str)] = &[
 /// approval and again before PostgreSQL purge. A new tenant table therefore
 /// blocks deletion until this manifest is intentionally updated.
 pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
+    "artifact_parents",
     "nip_fi_profile_heads",
     "api_tokens",
     "archived_identities",
@@ -130,6 +131,7 @@ const EXCLUDED_SCOPED_TABLES: &[&str] = &[
 
 /// Foreign-key-safe child-before-parent order for the PostgreSQL purge.
 pub const PURGE_SCOPED_TABLES: &[&str] = &[
+    "artifact_parents",
     "nip_fi_profile_heads",
     "personal_read_frontiers",
     "personal_read_accounts",
