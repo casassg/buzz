@@ -6203,8 +6203,13 @@ pub(crate) mod postgres_tests {
             let event = nostr::EventBuilder::new(nostr::Kind::Metadata, content)
                 .sign_with_keys(&Keys::generate())
                 .expect("sign profile");
-            rt.block_on(state.db.replace_addressable_event(community, &event, None))
-                .expect("store profile");
+            rt.block_on(state.db.replace_addressable_event(
+                community,
+                &event,
+                None,
+                buzz_db::ArchiveGate::Exempt,
+            ))
+            .expect("store profile");
             event
         };
         let named = store(r#"{"name":"wes","display_name":"Wes Anderson"}"#);
@@ -8855,6 +8860,7 @@ pub(crate) mod postgres_tests {
                 CommunityId::from_uuid(community),
                 &canvas_ev,
                 Some(channel_id),
+                buzz_db::ArchiveGate::Exempt,
             )
             .await
             .expect("insert canvas event on writer");
@@ -9074,7 +9080,7 @@ pub(crate) mod postgres_tests {
             .await
             .expect("create channel");
             buzz_db::Db::from_pool(pool.clone())
-                .insert_event(cid, &root, Some(channel))
+                .insert_event(cid, &root, Some(channel), buzz_db::ArchiveGate::Exempt)
                 .await
                 .expect("insert root");
             pools.push(pool);

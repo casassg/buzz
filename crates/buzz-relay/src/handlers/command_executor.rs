@@ -98,12 +98,18 @@ enum PersistResult {
 /// persists without the event record. On retry, the event INSERT succeeds
 /// (no conflict), and the mutation re-executes — which is safe for idempotent
 /// operations (open_dm, hide_dm, update_approval, upsert_workflow).
+///
+/// Under [`buzz_db::ArchiveGate::Refuse`] the transaction first takes the
+/// write gate of the event's channel (and, for a replaceable command, of the
+/// channels of its live versions), so a command into an archived channel is
+/// refused and stores nothing. The mutations that follow take no gate.
 #[datastore_span(name = "persist_command_event", system = "postgresql")]
 async fn persist_command_event(
     db: &buzz_db::Db,
     tenant: &TenantContext,
     event: &Event,
     channel_id_override: Option<Uuid>,
+    gate: buzz_db::ArchiveGate,
 ) -> Result<PersistResult, IngestError> {
     use buzz_db::replaceable::{ParameterizedReplacePrecondition, ParameterizedReplaceStatus};
 
@@ -127,6 +133,11 @@ async fn persist_command_event(
                 buzz_db::event::D_TAG_MAX_LEN,
             )));
         }
+        let gates = buzz_db::replaceable::lock_parameterized_write_gates(
+            &mut tx, gate, event, d_tag, channel_id,
+        )
+        .await
+        .map_err(command_write_error)?;
 
         let kind = event.kind.as_u16() as i32;
         let (expected_revision, revision_error) = match parse_expected_workflow_revision(
@@ -150,11 +161,10 @@ async fn persist_command_event(
                 d_tag,
                 channel_id,
                 precondition,
+                &gates,
             )
             .await
-            .map_err(|e| {
-                IngestError::Internal(format!("error: replace parameterized event: {e}"))
-            })?;
+            .map_err(command_write_error)?;
 
         return match result.status {
             ParameterizedReplaceStatus::Inserted => Ok(PersistResult::Inserted(tx)),
@@ -182,13 +192,28 @@ async fn persist_command_event(
         };
     }
 
+    buzz_db::lifecycle::lock_write_gates(&mut tx, gate, channel_id.as_slice())
+        .await
+        .map_err(command_write_error)?;
     let (_, was_inserted) = buzz_db::event::insert_event_in_transaction(&mut tx, event, channel_id)
         .await
-        .map_err(|e| IngestError::Internal(format!("error: insert event: {e}")))?;
+        .map_err(command_write_error)?;
     if was_inserted {
         Ok(PersistResult::Inserted(tx))
     } else {
         Ok(PersistResult::Duplicate)
+    }
+}
+
+/// The client reply for a failed command write: an archived channel is the
+/// client's error, a lifecycle race is a 409, anything else is ours.
+fn command_write_error(error: buzz_db::DbError) -> IngestError {
+    match error {
+        error if super::ingest::is_archived_refusal(&error) => super::ingest::archived_rejection(),
+        buzz_db::DbError::LifecycleConflict => {
+            IngestError::CanvasConflict("conflict: lifecycle changed".into())
+        }
+        error => IngestError::Internal(format!("error: persist command event: {error}")),
     }
 }
 
@@ -330,16 +355,19 @@ async fn handle_dm_open(
     }
 
     // Persist the command event (idempotency) — returns open transaction
-    let tx = match persist_command_event(&state.db, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
+    let tx =
+        match persist_command_event(&state.db, tenant, event, None, buzz_db::ArchiveGate::Refuse)
+            .await?
+        {
+            PersistResult::Duplicate => {
+                return Ok(IngestResult {
+                    event_id: event.id.to_hex(),
+                    accepted: true,
+                    message: "duplicate: already processed".into(),
+                });
+            }
+            PersistResult::Inserted(tx) => tx,
+        };
 
     // 4. Execute: open_dm
     let all_refs: Vec<&[u8]> = all_bytes.iter().map(|b| b.as_slice()).collect();
@@ -492,16 +520,19 @@ async fn handle_dm_add_member(
     }
 
     // Persist the command event — returns open transaction
-    let tx = match persist_command_event(&state.db, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
+    let tx =
+        match persist_command_event(&state.db, tenant, event, None, buzz_db::ArchiveGate::Refuse)
+            .await?
+        {
+            PersistResult::Duplicate => {
+                return Ok(IngestResult {
+                    event_id: event.id.to_hex(),
+                    accepted: true,
+                    message: "duplicate: already processed".into(),
+                });
+            }
+            PersistResult::Inserted(tx) => tx,
+        };
 
     // 6. Execute: open_dm with expanded set (creates NEW DM — DM sets are immutable)
     let all_refs: Vec<&[u8]> = all_bytes.iter().map(|b| b.as_slice()).collect();
@@ -597,17 +628,21 @@ async fn handle_dm_hide(
         return Err(IngestError::Rejected("invalid: channel is not a DM".into()));
     }
 
-    // Persist the command event — returns open transaction
-    let tx = match persist_command_event(&state.db, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
+    // Persist the command event — returns open transaction. Hiding a DM is
+    // the caller's own view state, so an archived DM does not refuse it (Q2).
+    let tx =
+        match persist_command_event(&state.db, tenant, event, None, buzz_db::ArchiveGate::Exempt)
+            .await?
+        {
+            PersistResult::Duplicate => {
+                return Ok(IngestResult {
+                    event_id: event.id.to_hex(),
+                    accepted: true,
+                    message: "duplicate: already processed".into(),
+                });
+            }
+            PersistResult::Inserted(tx) => tx,
+        };
 
     // 4. Execute: hide_dm
     state
@@ -750,16 +785,19 @@ async fn handle_workflow_def(
     let hash = compute_definition_hash(&definition_json_final);
 
     // Persist the command event — returns open transaction
-    let tx = match persist_command_event(&state.db, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
+    let tx =
+        match persist_command_event(&state.db, tenant, event, None, buzz_db::ArchiveGate::Refuse)
+            .await?
+        {
+            PersistResult::Duplicate => {
+                return Ok(IngestResult {
+                    event_id: event.id.to_hex(),
+                    accepted: true,
+                    message: "duplicate: already processed".into(),
+                });
+            }
+            PersistResult::Inserted(tx) => tx,
+        };
 
     // 4. Execute: upsert by the NIP-33 d-tag UUID. A retry updates the same
     // row instead of creating another enabled workflow that would fan out on
@@ -892,7 +930,15 @@ async fn handle_workflow_trigger(
     // Persist the command event under the workflow channel even though the
     // trigger event itself only carries the workflow UUID. Storing channel
     // triggers as global events leaks workflow IDs to unrelated relay members.
-    let tx = match persist_command_event(&state.db, tenant, event, workflow.channel_id).await? {
+    let tx = match persist_command_event(
+        &state.db,
+        tenant,
+        event,
+        workflow.channel_id,
+        buzz_db::ArchiveGate::Refuse,
+    )
+    .await?
+    {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
@@ -1076,16 +1122,19 @@ async fn handle_approval_grant(
     check_approver_spec(&approval.approver_spec, &self_hex)?;
 
     // Persist the command event — returns open transaction
-    let tx = match persist_command_event(&state.db, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
+    let tx =
+        match persist_command_event(&state.db, tenant, event, None, buzz_db::ArchiveGate::Refuse)
+            .await?
+        {
+            PersistResult::Duplicate => {
+                return Ok(IngestResult {
+                    event_id: event.id.to_hex(),
+                    accepted: true,
+                    message: "duplicate: already processed".into(),
+                });
+            }
+            PersistResult::Inserted(tx) => tx,
+        };
 
     // 5. Execute: update approval status to granted
     let note = if event.content.is_empty() {
@@ -1187,16 +1236,19 @@ async fn handle_approval_deny(
     check_approver_spec(&approval.approver_spec, &self_hex)?;
 
     // Persist the command event — returns open transaction
-    let tx = match persist_command_event(&state.db, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
+    let tx =
+        match persist_command_event(&state.db, tenant, event, None, buzz_db::ArchiveGate::Refuse)
+            .await?
+        {
+            PersistResult::Duplicate => {
+                return Ok(IngestResult {
+                    event_id: event.id.to_hex(),
+                    accepted: true,
+                    message: "duplicate: already processed".into(),
+                });
+            }
+            PersistResult::Inserted(tx) => tx,
+        };
 
     // 5. Execute: update approval status to denied
     let note = if event.content.is_empty() {
@@ -1504,7 +1556,14 @@ mod postgres_tests {
             Some(&missing_revision),
             "missing-revision",
         );
-        let error = match persist_command_event(&db, &tenant, &missing_revision_update, None).await
+        let error = match persist_command_event(
+            &db,
+            &tenant,
+            &missing_revision_update,
+            None,
+            buzz_db::ArchiveGate::Exempt,
+        )
+        .await
         {
             Err(error) => error,
             Ok(_) => panic!("missing revision must not create a workflow"),
@@ -1515,15 +1574,16 @@ mod postgres_tests {
                 if message == "conflict: workflow revision does not exist"
         ));
 
-        let PersistResult::Inserted(tx) = persist_command_event(&db, &tenant, &create, None)
-            .await
-            .expect("persist create")
+        let PersistResult::Inserted(tx) =
+            persist_command_event(&db, &tenant, &create, None, buzz_db::ArchiveGate::Exempt)
+                .await
+                .expect("persist create")
         else {
             panic!("first create must insert");
         };
         tx.commit().await.expect("commit create");
         assert!(matches!(
-            persist_command_event(&db, &tenant, &create, None)
+            persist_command_event(&db, &tenant, &create, None, buzz_db::ArchiveGate::Exempt)
                 .await
                 .expect("replay create"),
             PersistResult::Duplicate
@@ -1557,15 +1617,16 @@ mod postgres_tests {
             .find(|candidate| candidate.id.as_bytes() > update.id.as_bytes())
             .expect("find same-second CAS-matching update dominated by current head");
 
-        let PersistResult::Inserted(tx) = persist_command_event(&db, &tenant, &update, None)
-            .await
-            .expect("persist update")
+        let PersistResult::Inserted(tx) =
+            persist_command_event(&db, &tenant, &update, None, buzz_db::ArchiveGate::Exempt)
+                .await
+                .expect("persist update")
         else {
             panic!("matching update must insert");
         };
         tx.commit().await.expect("commit update");
         assert!(matches!(
-            persist_command_event(&db, &tenant, &update, None)
+            persist_command_event(&db, &tenant, &update, None, buzz_db::ArchiveGate::Exempt)
                 .await
                 .expect("replay update"),
             PersistResult::Duplicate
@@ -1578,7 +1639,15 @@ mod postgres_tests {
             Some(&create_revision),
             "stale-revision",
         );
-        let error = match persist_command_event(&db, &tenant, &stale_revision_update, None).await {
+        let error = match persist_command_event(
+            &db,
+            &tenant,
+            &stale_revision_update,
+            None,
+            buzz_db::ArchiveGate::Exempt,
+        )
+        .await
+        {
             Err(error) => error,
             Ok(_) => panic!("stale revision must not replace the current workflow"),
         };
@@ -1588,7 +1657,15 @@ mod postgres_tests {
                 if message == "conflict: workflow changed since it was loaded"
         ));
 
-        let error = match persist_command_event(&db, &tenant, &dominated_update, None).await {
+        let error = match persist_command_event(
+            &db,
+            &tenant,
+            &dominated_update,
+            None,
+            buzz_db::ArchiveGate::Exempt,
+        )
+        .await
+        {
             Err(error) => error,
             Ok(_) => panic!("distinct dominated CAS update must not report duplicate success"),
         };
@@ -1629,7 +1706,7 @@ mod postgres_tests {
         tx.commit().await.expect("commit legacy seed");
 
         assert!(matches!(
-            persist_command_event(&db, &tenant, &legacy, None)
+            persist_command_event(&db, &tenant, &legacy, None, buzz_db::ArchiveGate::Exempt)
                 .await
                 .expect("exact legacy replay must remain idempotent"),
             PersistResult::Duplicate
@@ -1642,7 +1719,15 @@ mod postgres_tests {
             Some("not-hex"),
             "distinct-malformed",
         );
-        let error = match persist_command_event(&db, &tenant, &distinct, None).await {
+        let error = match persist_command_event(
+            &db,
+            &tenant,
+            &distinct,
+            None,
+            buzz_db::ArchiveGate::Exempt,
+        )
+        .await
+        {
             Err(error) => error,
             Ok(_) => panic!("distinct malformed revision must remain rejected"),
         };

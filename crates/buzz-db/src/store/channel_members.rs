@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::channel::{row_to_channel_record, ChannelRecord};
 use crate::error::{DbError, Result};
-use crate::{AdmittedTx, Db};
+use crate::{AdmittedTx, ArchiveGate, Db};
 use buzz_core::CommunityId;
 use buzz_datastore_tracing::datastore_span;
 
@@ -94,9 +94,10 @@ pub(crate) async fn verify_channel_roster_fence_catalog<'e>(
     Ok(())
 }
 
-/// Take the per-channel membership lock. MUST be the first statement in the
-/// transaction that then reads roles/owner counts and writes membership, so the
-/// whole check-then-write sequence is atomic against a concurrent one.
+/// Take the per-channel membership lock. MUST be the first lock in the
+/// transaction that then reads roles/owner counts and writes membership (only
+/// the channel write gates come before it), so the whole check-then-write
+/// sequence is atomic against a concurrent one.
 pub(crate) async fn acquire_channel_membership_lock(
     tx: &mut PgConnection,
     community_id: CommunityId,
@@ -748,9 +749,10 @@ pub enum MemberPutEventWrite {
 /// transaction. If any write fails, nothing is stored, so the client can
 /// resend the same event and have it applied.
 ///
-/// The membership lock comes first, as in [`put_members`] and the channel
-/// settings writers, so a second copy of the event waits for the first and
-/// then finds it stored.
+/// The channel's write gate (under `gate`) and then the membership lock come
+/// first, as in [`put_members`] and the channel settings writers, so a second
+/// copy of the event waits for the first and then finds it stored.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn put_members_with_event(
     pool: &PgPool,
     push_enqueue: Option<crate::runtime::push_enqueue::PushEnqueue>,
@@ -759,6 +761,7 @@ pub(crate) async fn put_members_with_event(
     event: &nostr::Event,
     targets: &[MemberPut<'_>],
     thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
+    gate: ArchiveGate,
 ) -> Result<MemberPutEventWrite> {
     check_distinct_targets(targets)?;
     let mut tx = crate::begin_community_event_write_transaction(
@@ -768,6 +771,7 @@ pub(crate) async fn put_members_with_event(
     )
     .await?;
     tx.set_push_enqueue(push_enqueue);
+    crate::lifecycle::lock_write_gates(&mut tx, gate, &[channel_id]).await?;
     acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
 
     // The same writes as `Db::insert_event_with_thread_metadata`.
@@ -794,6 +798,162 @@ pub(crate) async fn put_members_with_event(
     }
     tx.commit().await?;
     Ok(MemberPutEventWrite::Applied { stored, results })
+}
+
+/// The refusal of a kind:9021 join into a channel that is not open, as
+/// [`DbError::AccessDenied`].
+pub const CHANNEL_PRIVATE: &str = "channel is private";
+
+/// The result of [`Db::join_with_event`].
+pub enum JoinEventWrite {
+    /// The event was stored and its author joined the channel.
+    Joined {
+        /// The stored kind:9021 event.
+        stored: buzz_core::StoredEvent,
+        /// The author's membership row after the join.
+        member: MemberRecord,
+    },
+    /// The event was stored; its author was already an active member, so
+    /// nothing else changed.
+    AlreadyMember(buzz_core::StoredEvent),
+    /// The event was already stored. Nothing changed.
+    Duplicate(buzz_core::StoredEvent),
+}
+
+/// Store a kind:9021 `event` and add its author to the open channel
+/// `channel_id` in one transaction. The new member gets the channel's
+/// `join_role`, as from [`put_member`] with no actor.
+///
+/// Locks, in order: the channel's write gate (under `gate`), then the
+/// membership lock. A channel that is not open fails with
+/// [`DbError::AccessDenied`] ([`CHANNEL_PRIVATE`]); any refusal stores
+/// nothing.
+pub(crate) async fn join_with_event(
+    pool: &PgPool,
+    push_enqueue: Option<crate::runtime::push_enqueue::PushEnqueue>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    event: &nostr::Event,
+    thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
+    gate: ArchiveGate,
+) -> Result<JoinEventWrite> {
+    let mut tx = crate::begin_community_event_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
+    tx.set_push_enqueue(push_enqueue);
+    crate::lifecycle::lock_write_gates(&mut tx, gate, &[channel_id]).await?;
+    acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
+
+    let (stored, inserted) = crate::event::insert_event_with_thread_metadata_tx(
+        &mut tx,
+        event,
+        Some(channel_id),
+        thread_meta,
+    )
+    .await?;
+    if !inserted {
+        tx.rollback().await?;
+        return Ok(JoinEventWrite::Duplicate(stored));
+    }
+    crate::insert_mentions_in_transaction(&mut tx, event, Some(channel_id)).await?;
+
+    if get_channel_tx(tx.conn(), community_id, channel_id)
+        .await?
+        .visibility
+        != "open"
+    {
+        return Err(DbError::AccessDenied(CHANNEL_PRIVATE.into()));
+    }
+    let actor = event.pubkey.to_bytes();
+    if get_active_role_tx(tx.conn(), community_id, channel_id, &actor)
+        .await?
+        .is_some()
+    {
+        tx.commit().await?;
+        return Ok(JoinEventWrite::AlreadyMember(stored));
+    }
+    let target = MemberPut {
+        pubkey: &actor,
+        requested: None,
+    };
+    let put = put_members_on(&mut tx, channel_id, &[target], None)
+        .await?
+        .pop()
+        .ok_or_else(|| DbError::InvalidData("membership put returned no result".into()))??;
+    tx.commit().await?;
+    Ok(JoinEventWrite::Joined {
+        stored,
+        member: put.member,
+    })
+}
+
+/// The result of [`Db::remove_member_with_event`].
+pub enum MemberRemoveEventWrite {
+    /// The event was stored and the member was removed.
+    Removed(buzz_core::StoredEvent),
+    /// The event was stored, but the target was not an active member, so
+    /// nothing else changed.
+    NotMember(buzz_core::StoredEvent),
+    /// The event was already stored. Nothing changed.
+    Duplicate(buzz_core::StoredEvent),
+}
+
+/// Store a kind:9001 `event` and remove `pubkey` from `channel_id` with the
+/// event's author as the actor, in one transaction, under the rules of
+/// [`remove_member`].
+///
+/// Locks, in order: the channel's write gate (under `gate`), then the
+/// membership lock. A refusal decided under the lock
+/// ([`DbError::AccessDenied`]) stores nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remove_member_with_event(
+    pool: &PgPool,
+    push_enqueue: Option<crate::runtime::push_enqueue::PushEnqueue>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    event: &nostr::Event,
+    pubkey: &[u8],
+    thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
+    gate: ArchiveGate,
+) -> Result<MemberRemoveEventWrite> {
+    let actor = event.pubkey.to_bytes();
+    // Immutable, and read before the lock for the reason in `remove_member`.
+    let actor_is_agent_owner = pubkey != actor.as_slice()
+        && crate::user::is_agent_owner(pool, community_id, pubkey, &actor).await?;
+    let mut tx = crate::begin_community_event_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
+    tx.set_push_enqueue(push_enqueue);
+    crate::lifecycle::lock_write_gates(&mut tx, gate, &[channel_id]).await?;
+    acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
+
+    let (stored, inserted) = crate::event::insert_event_with_thread_metadata_tx(
+        &mut tx,
+        event,
+        Some(channel_id),
+        thread_meta,
+    )
+    .await?;
+    if !inserted {
+        tx.rollback().await?;
+        return Ok(MemberRemoveEventWrite::Duplicate(stored));
+    }
+    crate::insert_mentions_in_transaction(&mut tx, event, Some(channel_id)).await?;
+
+    let outcome =
+        match remove_member_on(&mut tx, channel_id, pubkey, &actor, actor_is_agent_owner).await {
+            Ok(()) => MemberRemoveEventWrite::Removed(stored),
+            Err(DbError::MemberNotFound(_)) => MemberRemoveEventWrite::NotMember(stored),
+            Err(error) => return Err(error),
+        };
+    tx.commit().await?;
+    Ok(outcome)
 }
 
 fn check_distinct_targets(targets: &[MemberPut<'_>]) -> Result<()> {
@@ -1028,7 +1188,29 @@ pub async fn remove_member(
     // the UPDATE against concurrent membership writes on this channel (same key
     // as `add_member`).
     acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
+    remove_member_on(
+        &mut tx,
+        channel_id,
+        pubkey,
+        actor_pubkey,
+        actor_is_agent_owner,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
 
+/// The checks and write of [`remove_member`], on a transaction that holds
+/// `channel_id`'s membership lock. The caller owns the commit.
+async fn remove_member_on(
+    tx: &mut AdmittedTx,
+    channel_id: Uuid,
+    pubkey: &[u8],
+    actor_pubkey: &[u8],
+    actor_is_agent_owner: bool,
+) -> Result<()> {
+    let community_id = tx.community();
+    let is_self_remove = pubkey == actor_pubkey;
     if !is_self_remove {
         let actor_role_str = get_active_role_tx(tx.conn(), community_id, channel_id, actor_pubkey)
             .await?
@@ -1081,8 +1263,6 @@ pub async fn remove_member(
     if result.rows_affected() == 0 {
         return Err(DbError::MemberNotFound(channel_id));
     }
-
-    tx.commit().await?;
     Ok(())
 }
 
@@ -2153,6 +2333,7 @@ impl Db {
         event: &nostr::Event,
         targets: &[MemberPut<'_>],
         thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
+        gate: ArchiveGate,
     ) -> Result<MemberPutEventWrite> {
         put_members_with_event(
             &self.pool,
@@ -2162,6 +2343,56 @@ impl Db {
             event,
             targets,
             thread_meta,
+            gate,
+        )
+        .await
+    }
+
+    /// Stores a kind:9021 `event` and adds its author to the open channel,
+    /// in one transaction (see [`join_with_event`]).
+    #[datastore_span(name = "join_with_event", system = "postgresql")]
+    pub async fn join_with_event(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        event: &nostr::Event,
+        thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
+        gate: ArchiveGate,
+    ) -> Result<JoinEventWrite> {
+        join_with_event(
+            &self.pool,
+            self.push_enqueue.clone(),
+            community_id,
+            channel_id,
+            event,
+            thread_meta,
+            gate,
+        )
+        .await
+    }
+
+    /// Stores a kind:9001 `event` and removes `pubkey`, with the event's
+    /// author as the actor, in one transaction (see
+    /// [`remove_member_with_event`]).
+    #[datastore_span(name = "remove_member_with_event", system = "postgresql")]
+    pub async fn remove_member_with_event(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        event: &nostr::Event,
+        pubkey: &[u8],
+        thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
+        gate: ArchiveGate,
+    ) -> Result<MemberRemoveEventWrite> {
+        remove_member_with_event(
+            &self.pool,
+            self.push_enqueue.clone(),
+            community_id,
+            channel_id,
+            event,
+            pubkey,
+            thread_meta,
+            gate,
         )
         .await
     }
@@ -3594,10 +3825,18 @@ mod postgres_tests {
 
         // A non-member may not add anyone to a private channel.
         let refused = event(&outsider);
-        let write =
-            put_members_with_event(&pool, None, community, channel.id, &refused, &targets, None)
-                .await
-                .expect("refused write");
+        let write = put_members_with_event(
+            &pool,
+            None,
+            community,
+            channel.id,
+            &refused,
+            &targets,
+            None,
+            crate::ArchiveGate::Exempt,
+        )
+        .await
+        .expect("refused write");
         assert!(
             matches!(&write, MemberPutEventWrite::Refused(errors)
                 if matches!(errors.as_slice(), [DbError::AccessDenied(_)])),
@@ -3612,10 +3851,18 @@ mod postgres_tests {
         );
 
         let added = event(&owner);
-        let write =
-            put_members_with_event(&pool, None, community, channel.id, &added, &targets, None)
-                .await
-                .expect("applied write");
+        let write = put_members_with_event(
+            &pool,
+            None,
+            community,
+            channel.id,
+            &added,
+            &targets,
+            None,
+            crate::ArchiveGate::Exempt,
+        )
+        .await
+        .expect("applied write");
         let MemberPutEventWrite::Applied { results, .. } = write else {
             panic!("expected the event to apply");
         };
@@ -3627,10 +3874,18 @@ mod postgres_tests {
         remove_member(&pool, community, channel.id, &person, &owner_pk)
             .await
             .expect("remove person");
-        let write =
-            put_members_with_event(&pool, None, community, channel.id, &added, &targets, None)
-                .await
-                .expect("duplicate write");
+        let write = put_members_with_event(
+            &pool,
+            None,
+            community,
+            channel.id,
+            &added,
+            &targets,
+            None,
+            crate::ArchiveGate::Exempt,
+        )
+        .await
+        .expect("duplicate write");
         assert!(matches!(write, MemberPutEventWrite::Duplicate(_)));
         assert_eq!(
             get_member_role(&pool, community, channel.id, &person)
@@ -4539,7 +4794,12 @@ mod postgres_tests {
         let db = Db::from_pool(pool.clone());
         for (name, community, channel, event, trigger) in measured {
             let app = db
-                .replace_addressable_event(community, &event, Some(channel))
+                .replace_addressable_event(
+                    community,
+                    &event,
+                    Some(channel),
+                    crate::ArchiveGate::Exempt,
+                )
                 .await
                 .map(|(_, inserted)| inserted)
                 .map_err(|error| match error {
@@ -4574,14 +4834,27 @@ mod postgres_tests {
         let db = Db::from_pool(pool.clone());
 
         for result in [
-            db.insert_event(community, &stale, Some(channel.id)).await,
-            db.insert_event_with_thread_metadata(community, &stale, Some(channel.id), None)
-                .await,
+            db.insert_event(
+                community,
+                &stale,
+                Some(channel.id),
+                crate::ArchiveGate::Exempt,
+            )
+            .await,
+            db.insert_event_with_thread_metadata(
+                community,
+                &stale,
+                Some(channel.id),
+                None,
+                crate::ArchiveGate::Exempt,
+            )
+            .await,
             db.replace_parameterized_event(
                 community,
                 &stale,
                 &channel.id.to_string(),
                 Some(channel.id),
+                crate::ArchiveGate::Exempt,
             )
             .await,
         ] {
@@ -4635,7 +4908,12 @@ mod postgres_tests {
         let old_id = old.id.as_bytes().to_vec();
         let writer = tokio::spawn(async move {
             Db::from_pool(writer_pool)
-                .replace_addressable_event(community, &old, Some(channel.id))
+                .replace_addressable_event(
+                    community,
+                    &old,
+                    Some(channel.id),
+                    crate::ArchiveGate::Exempt,
+                )
                 .await
         });
         // A waiting advisory lock proves the old publication has reached the
@@ -5268,10 +5546,15 @@ mod postgres_tests {
         let base = Timestamp::now().as_secs();
         let fresh = roster("admin", base);
         assert!(
-            db.replace_addressable_event(community, &fresh, Some(channel))
-                .await
-                .expect("publish canonical role")
-                .1
+            db.replace_addressable_event(
+                community,
+                &fresh,
+                Some(channel),
+                crate::ArchiveGate::Exempt
+            )
+            .await
+            .expect("publish canonical role")
+            .1
         );
         let stale = roster("member", base + 1);
         // Reproduce the old binary on one connection: replacement key ->

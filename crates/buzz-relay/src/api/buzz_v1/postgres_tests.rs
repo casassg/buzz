@@ -195,7 +195,12 @@ async fn accessory_router_signed_url_body_replay_and_actor_boundary() {
         .unwrap();
     state
         .db
-        .insert_event(community, &event, Some(channel))
+        .insert_event(
+            community,
+            &event,
+            Some(channel),
+            buzz_db::ArchiveGate::Exempt,
+        )
         .await
         .unwrap();
     state
@@ -307,7 +312,12 @@ async fn accessory_batch_outcomes_are_independent_and_return_applied_rows() {
                 .unwrap();
             state
                 .db
-                .insert_event(community, &event, Some(channel))
+                .insert_event(
+                    community,
+                    &event,
+                    Some(channel),
+                    buzz_db::ArchiveGate::Exempt,
+                )
                 .await
                 .unwrap();
             event.id.to_hex()
@@ -550,7 +560,12 @@ async fn accessory_write_revocation_is_terminal_before_persistence() {
         .unwrap();
     state
         .db
-        .insert_event(community, &event, Some(channel))
+        .insert_event(
+            community,
+            &event,
+            Some(channel),
+            buzz_db::ArchiveGate::Exempt,
+        )
         .await
         .unwrap();
     let intent = buzz_db::personal_read::ReadIntent::MarkThrough {

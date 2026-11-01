@@ -48,7 +48,7 @@ async fn seed(
     .custom_created_at(Timestamp::from(created_at))
     .sign_with_keys(keys)
     .expect("sign definition");
-    db.replace_parameterized_event(community, &event, d_tag, None)
+    db.replace_parameterized_event(community, &event, d_tag, None, crate::ArchiveGate::Exempt)
         .await
         .expect("seed definition");
     EventQuery {
@@ -274,12 +274,30 @@ async fn legacy_stored_deletion_repair_has_one_committed_dispatch_owner() {
         .sign_with_keys(&keys)
         .expect("sign legacy deletion");
     // Older relay versions could persist the request without applying deletion.
-    db.insert_event_with_thread_metadata(community, &deletion, None, None)
-        .await
-        .expect("legacy request");
+    db.insert_event_with_thread_metadata(
+        community,
+        &deletion,
+        None,
+        None,
+        crate::ArchiveGate::Exempt,
+    )
+    .await
+    .expect("legacy request");
     let (first, second) = tokio::join!(
-        db.insert_workflow_deletion(community, &deletion, &owner, &d_tag),
-        db.insert_workflow_deletion(community, &deletion, &owner, &d_tag),
+        db.insert_workflow_deletion(
+            community,
+            &deletion,
+            &owner,
+            &d_tag,
+            crate::ArchiveGate::Exempt
+        ),
+        db.insert_workflow_deletion(
+            community,
+            &deletion,
+            &owner,
+            &d_tag,
+            crate::ArchiveGate::Exempt
+        ),
     );
     let (_, first_dispatch, _) = first.expect("first repair");
     let (_, second_dispatch, _) = second.expect("concurrent repair");
@@ -289,10 +307,16 @@ async fn legacy_stored_deletion_repair_has_one_committed_dispatch_owner() {
     );
     assert_absent(&db, &query, id).await;
     assert!(
-        !db.insert_workflow_deletion(community, &deletion, &owner, &d_tag)
-            .await
-            .expect("completed duplicate")
-            .1
+        !db.insert_workflow_deletion(
+            community,
+            &deletion,
+            &owner,
+            &d_tag,
+            crate::ArchiveGate::Exempt
+        )
+        .await
+        .expect("completed duplicate")
+        .1
     );
 }
 
@@ -340,7 +364,13 @@ async fn quiescing_community_rejects_workflow_deletion_at_admission_before_repla
     .expect_err("a quiescing community must reject coordinate deletion");
     let with_request = tokio::time::timeout(
         bounded,
-        db.insert_workflow_deletion(community, &deletion, &owner, &d_tag),
+        db.insert_workflow_deletion(
+            community,
+            &deletion,
+            &owner,
+            &d_tag,
+            crate::ArchiveGate::Exempt,
+        ),
     )
     .await
     .expect("admission must reject before any deletion write")

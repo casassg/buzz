@@ -446,9 +446,16 @@ impl ActionSink for RelayActionSink {
                     &event,
                     Some(channel_uuid),
                     thread_meta,
+                    buzz_db::ArchiveGate::Refuse,
                 )
                 .await
-                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+                .map_err(|e| {
+                    // The channel was archived after the check above.
+                    if crate::handlers::ingest::is_archived_refusal(&e) {
+                        return ActionSinkError::ChannelArchived(channel_id_canonical.clone());
+                    }
+                    ActionSinkError::Database(e.to_string())
+                })?;
 
             // 5. Post-persist side effects (fan-out, search, audit)
             //    Only if actually inserted (idempotency guard).
@@ -1222,7 +1229,12 @@ mod postgres_tests {
         let root_hex = root_event.id.to_hex();
         state
             .db
-            .insert_event(community, &root_event, Some(channel.id))
+            .insert_event(
+                community,
+                &root_event,
+                Some(channel.id),
+                buzz_db::ArchiveGate::Exempt,
+            )
             .await
             .expect("insert root");
 
@@ -1240,7 +1252,12 @@ mod postgres_tests {
         let parent_hex = parent_event.id.to_hex();
         state
             .db
-            .insert_event(community, &parent_event, Some(channel.id))
+            .insert_event(
+                community,
+                &parent_event,
+                Some(channel.id),
+                buzz_db::ArchiveGate::Exempt,
+            )
             .await
             .expect("insert parent");
         assert!(
@@ -1332,7 +1349,12 @@ mod postgres_tests {
         let root_only_parent_bytes = root_only_parent.id.as_bytes().to_vec();
         state
             .db
-            .insert_event(community, &root_only_parent, Some(channel.id))
+            .insert_event(
+                community,
+                &root_only_parent,
+                Some(channel.id),
+                buzz_db::ArchiveGate::Exempt,
+            )
             .await
             .expect("insert root-only parent");
 
@@ -1469,7 +1491,12 @@ mod postgres_tests {
             async move {
                 state
                     .db
-                    .insert_event(community, &event, Some(channel_id))
+                    .insert_event(
+                        community,
+                        &event,
+                        Some(channel_id),
+                        buzz_db::ArchiveGate::Exempt,
+                    )
                     .await
                     .expect("insert parent");
                 event.id.to_hex()
