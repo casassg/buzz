@@ -14,7 +14,7 @@ use nostr::Event;
 use uuid::Uuid;
 
 use crate::event::ThreadMetadataParams;
-use crate::{AdmittedTx, ArchiveGate, Db, DbError, Result, WriteGates};
+use crate::{AdmittedTx, ArchiveGate, Db, DbError, Result};
 
 /// The key of a reaction row: its target event, the target's `created_at`,
 /// the reacting pubkey and the emoji.
@@ -220,21 +220,16 @@ impl Db {
             d_tag,
         } = coordinate;
         let mut tx = self.begin_event_write_transaction(community_id).await?;
-        let gates = if gate == ArchiveGate::Exempt {
-            WriteGates::exempt()
-        } else {
-            let mut channels = crate::replaceable::live_version_channels(
-                &mut tx,
-                kind,
-                pubkey,
-                d_tag,
-                Some(cutoff),
-            )
-            .await?;
-            channels.extend(channel_id);
-            let channels: Vec<Uuid> = channels.into_iter().collect();
-            crate::lifecycle::lock_write_gates(&mut tx, gate, &channels).await?
-        };
+        let gates = crate::replaceable::lock_coordinate_write_gates(
+            &mut tx,
+            gate,
+            kind,
+            pubkey,
+            d_tag,
+            Some(cutoff),
+            channel_id.as_slice(),
+        )
+        .await?;
 
         let lock_key = crate::replaceable::event_replacement_lock_key(
             community_id,

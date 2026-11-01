@@ -991,14 +991,14 @@ pub(crate) fn archived_rejection() -> IngestError {
 
 /// The reply to a failed gated write: an archived channel keeps the text of
 /// the unlocked archived check, a lifecycle race is a 409, and anything else
-/// is ours.
-fn gated_write_error(error: buzz_db::DbError) -> IngestError {
+/// is ours, as `error: {context}{error}`.
+pub(crate) fn gated_write_error(error: buzz_db::DbError, context: &str) -> IngestError {
     match error {
         error if is_archived_refusal(&error) => archived_rejection(),
         buzz_db::DbError::LifecycleConflict => {
             IngestError::CanvasConflict("conflict: lifecycle changed".into())
         }
-        error => IngestError::Internal(format!("error: {error}")),
+        error => IngestError::Internal(format!("error: {context}{error}")),
     }
 }
 
@@ -3761,7 +3761,7 @@ async fn ingest_event_inner(
             .db
             .replace_addressable_event(tenant.community(), &event, channel_id, archive_gate)
             .await
-            .map_err(gated_write_error)?
+            .map_err(|error| gated_write_error(error, ""))?
     } else if is_parameterized_replaceable(kind_u32) {
         // NIP-33 parameterized replaceable — keyed by (kind, pubkey, d_tag).
         let d_tag = buzz_db::event::extract_d_tag(&event).unwrap_or_default();
@@ -3782,7 +3782,7 @@ async fn ingest_event_inner(
                 archive_gate,
             )
             .await
-            .map_err(gated_write_error)?
+            .map_err(|error| gated_write_error(error, ""))?
     } else if let Some(spec) = canvas_revision_spec.as_ref() {
         // Canvas write carrying an optimistic-concurrency precondition. Plain
         // canvas writes (no `expected-revision` tag) fall through to the generic
@@ -3805,7 +3805,7 @@ async fn ingest_event_inner(
                 archive_gate,
             )
             .await
-            .map_err(gated_write_error)?;
+            .map_err(|error| gated_write_error(error, ""))?;
         match status {
             buzz_db::ChannelHeadWriteStatus::RevisionMissing => {
                 return Err(IngestError::CanvasConflict(

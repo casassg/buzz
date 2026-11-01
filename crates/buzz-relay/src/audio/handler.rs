@@ -3325,6 +3325,8 @@ async fn commit_participant_join(
         Ok(_) => {}
         Err(error) if crate::handlers::ingest::is_archived_refusal(&error) => {
             retire_shadow();
+            #[cfg(test)]
+            crate::nip_fi_test_hooks::before_join_refusal_rollback(tenant.community()).await;
             let _ = tx.rollback().await;
             return Err(JoinCommitError::Archived);
         }

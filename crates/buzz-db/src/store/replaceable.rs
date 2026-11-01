@@ -125,7 +125,8 @@ pub(crate) async fn live_version_channels(
 }
 
 /// Take the write gates a parameterized replacement of `event` needs: its
-/// own channel and the channel of every live version it would supersede.
+/// own `channels` (its channel, and any other channel the write must gate)
+/// and the channel of every live version it would supersede.
 ///
 /// A replacement supersedes the coordinate in every channel, so an
 /// [`ArchiveGate::Refuse`] write is refused when any of those channels is
@@ -137,22 +138,41 @@ pub async fn lock_parameterized_write_gates(
     gate: ArchiveGate,
     event: &nostr::Event,
     d_tag: &str,
-    channel_id: Option<Uuid>,
+    channels: &[Uuid],
 ) -> Result<WriteGates> {
-    if gate == ArchiveGate::Exempt {
-        return Ok(WriteGates::exempt());
-    }
-    let mut channels = live_version_channels(
+    lock_coordinate_write_gates(
         tx,
+        gate,
         buzz_core::kind::event_kind_i32(event),
         event.pubkey.to_bytes().as_slice(),
         d_tag,
         None,
+        channels,
     )
-    .await?;
-    channels.extend(channel_id);
-    let channels: Vec<Uuid> = channels.into_iter().collect();
-    crate::lifecycle::lock_write_gates(tx, gate, &channels).await
+    .await
+}
+
+/// Take the write gates of a write to the coordinate `(kind, pubkey, d_tag)`:
+/// its own `channels` and the channel of every live version, optionally only
+/// those created at or before `created_at_or_before`. This is the one
+/// definition of the channels a coordinate write touches. Each caller
+/// re-checks its own versions under the coordinate lock.
+pub(crate) async fn lock_coordinate_write_gates(
+    tx: &mut AdmittedTx,
+    gate: ArchiveGate,
+    kind: i32,
+    pubkey: &[u8],
+    d_tag: &str,
+    created_at_or_before: Option<DateTime<Utc>>,
+    channels: &[Uuid],
+) -> Result<WriteGates> {
+    if gate == ArchiveGate::Exempt {
+        return Ok(WriteGates::exempt());
+    }
+    let mut gated = live_version_channels(tx, kind, pubkey, d_tag, created_at_or_before).await?;
+    gated.extend(channels);
+    let gated: Vec<Uuid> = gated.into_iter().collect();
+    crate::lifecycle::lock_write_gates(tx, gate, &gated).await
 }
 
 /// Replace a parameterized event in a caller-owned transaction.
@@ -739,8 +759,14 @@ impl Db {
             observability::TransactionTimer::start(TransactionOperation::ReplaceParameterizedEvent);
         transaction_timer
             .observe(async {
-                let gates =
-                    lock_parameterized_write_gates(&mut tx, gate, event, d_tag, channel_id).await?;
+                let gates = lock_parameterized_write_gates(
+                    &mut tx,
+                    gate,
+                    event,
+                    d_tag,
+                    channel_id.as_slice(),
+                )
+                .await?;
                 let result = self
                     .replace_parameterized_event_in_transaction(
                         &mut tx,

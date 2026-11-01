@@ -2700,6 +2700,8 @@ impl Db {
     /// when it is not newer than the deletion request.
     /// Used by NIP-09 a-tag deletion for parameterized-replaceable kinds;
     /// `deletion_created_at_secs` is the deletion event's `created_at`.
+    ///
+    /// Ungated test fixture, no production caller: use [`Db::insert_coordinate_deletion`].
     #[datastore_span(name = "soft_delete_by_coordinate", system = "postgresql")]
     pub async fn soft_delete_by_coordinate(
         &self,
@@ -2721,6 +2723,8 @@ impl Db {
     }
 
     /// Atomically soft-delete an event and decrement thread reply counters.
+    ///
+    /// Ungated test fixture, no production caller: use [`Db::insert_event_deletion`].
     #[datastore_span(name = "soft_delete_event_and_update_thread", system = "postgresql")]
     pub async fn soft_delete_event_and_update_thread(
         &self,

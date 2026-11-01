@@ -648,7 +648,9 @@ impl Db {
         .await
     }
 
-    /// Soft-delete a reaction.
+    /// Soft-delete a reaction. Test-only: production removes a reaction
+    /// with its kind:5 in [`Db::insert_event_deletion`].
+    #[cfg(test)]
     #[datastore_span(name = "remove_reaction", system = "postgresql")]
     pub async fn remove_reaction(
         &self,
@@ -669,7 +671,9 @@ impl Db {
         .await
     }
 
-    /// Soft-delete a reaction by its source event ID.
+    /// Soft-delete a reaction by its source event ID. Test-only: production
+    /// removes a reaction with its kind:5 in [`Db::insert_event_deletion`].
+    #[cfg(test)]
     #[datastore_span(name = "remove_reaction_by_source_event_id", system = "postgresql")]
     pub async fn remove_reaction_by_source_event_id(
         &self,

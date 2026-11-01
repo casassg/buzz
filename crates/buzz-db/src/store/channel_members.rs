@@ -728,6 +728,53 @@ pub async fn put_members(
     Ok(results)
 }
 
+/// A membership command event from [`begin_member_event_write`].
+enum MemberEventTx {
+    /// Stored, with its mentions, in the open transaction.
+    Stored(AdmittedTx, buzz_core::StoredEvent),
+    /// Already stored. The transaction is rolled back.
+    Duplicate(buzz_core::StoredEvent),
+}
+
+/// Begin the transaction of a membership command `event` in `channel_id` and
+/// store the event with its mentions. This is the one place that orders the
+/// `*_with_event` locks: the channel's write gate (under `gate`), then the
+/// membership lock. A second copy of the event waits for the first and then
+/// finds it stored.
+async fn begin_member_event_write(
+    pool: &PgPool,
+    push_enqueue: Option<crate::runtime::push_enqueue::PushEnqueue>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    event: &nostr::Event,
+    thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
+    gate: ArchiveGate,
+) -> Result<MemberEventTx> {
+    let mut tx = crate::begin_community_event_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
+    tx.set_push_enqueue(push_enqueue);
+    crate::lifecycle::lock_write_gates(&mut tx, gate, &[channel_id]).await?;
+    acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
+
+    let (stored, inserted) = crate::event::insert_event_with_thread_metadata_tx(
+        &mut tx,
+        event,
+        Some(channel_id),
+        thread_meta,
+    )
+    .await?;
+    if !inserted {
+        tx.rollback().await?;
+        return Ok(MemberEventTx::Duplicate(stored));
+    }
+    crate::insert_mentions_in_transaction(&mut tx, event, Some(channel_id)).await?;
+    Ok(MemberEventTx::Stored(tx, stored))
+}
+
 /// The result of [`Db::put_members_with_event`].
 pub enum MemberPutEventWrite {
     /// The event was stored and at least one person was written. One result
@@ -749,9 +796,7 @@ pub enum MemberPutEventWrite {
 /// transaction. If any write fails, nothing is stored, so the client can
 /// resend the same event and have it applied.
 ///
-/// The channel's write gate (under `gate`) and then the membership lock come
-/// first, as in [`put_members`] and the channel settings writers, so a second
-/// copy of the event waits for the first and then finds it stored.
+/// Locks and duplicates as in [`begin_member_event_write`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn put_members_with_event(
     pool: &PgPool,
@@ -764,29 +809,20 @@ pub(crate) async fn put_members_with_event(
     gate: ArchiveGate,
 ) -> Result<MemberPutEventWrite> {
     check_distinct_targets(targets)?;
-    let mut tx = crate::begin_community_event_write_transaction(
+    let (mut tx, stored) = match begin_member_event_write(
         pool,
+        push_enqueue,
         community_id,
-        crate::observability::WriterOperation::EventWrite,
-    )
-    .await?;
-    tx.set_push_enqueue(push_enqueue);
-    crate::lifecycle::lock_write_gates(&mut tx, gate, &[channel_id]).await?;
-    acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
-
-    // The same writes as `Db::insert_event_with_thread_metadata`.
-    let (stored, inserted) = crate::event::insert_event_with_thread_metadata_tx(
-        &mut tx,
+        channel_id,
         event,
-        Some(channel_id),
         thread_meta,
+        gate,
     )
-    .await?;
-    if !inserted {
-        tx.rollback().await?;
-        return Ok(MemberPutEventWrite::Duplicate(stored));
-    }
-    crate::insert_mentions_in_transaction(&mut tx, event, Some(channel_id)).await?;
+    .await?
+    {
+        MemberEventTx::Stored(tx, stored) => (tx, stored),
+        MemberEventTx::Duplicate(stored) => return Ok(MemberPutEventWrite::Duplicate(stored)),
+    };
 
     let actor = event.pubkey.to_bytes();
     let results = put_members_on(&mut tx, channel_id, targets, Some(&actor)).await?;
@@ -824,10 +860,9 @@ pub enum JoinEventWrite {
 /// `channel_id` in one transaction. The new member gets the channel's
 /// `join_role`, as from [`put_member`] with no actor.
 ///
-/// Locks, in order: the channel's write gate (under `gate`), then the
-/// membership lock. A channel that is not open fails with
-/// [`DbError::AccessDenied`] ([`CHANNEL_PRIVATE`]); any refusal stores
-/// nothing.
+/// Locks and duplicates as in [`begin_member_event_write`]. A channel that
+/// is not open fails with [`DbError::AccessDenied`] ([`CHANNEL_PRIVATE`]);
+/// any refusal stores nothing.
 pub(crate) async fn join_with_event(
     pool: &PgPool,
     push_enqueue: Option<crate::runtime::push_enqueue::PushEnqueue>,
@@ -837,28 +872,20 @@ pub(crate) async fn join_with_event(
     thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
     gate: ArchiveGate,
 ) -> Result<JoinEventWrite> {
-    let mut tx = crate::begin_community_event_write_transaction(
+    let (mut tx, stored) = match begin_member_event_write(
         pool,
+        push_enqueue,
         community_id,
-        crate::observability::WriterOperation::EventWrite,
-    )
-    .await?;
-    tx.set_push_enqueue(push_enqueue);
-    crate::lifecycle::lock_write_gates(&mut tx, gate, &[channel_id]).await?;
-    acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
-
-    let (stored, inserted) = crate::event::insert_event_with_thread_metadata_tx(
-        &mut tx,
+        channel_id,
         event,
-        Some(channel_id),
         thread_meta,
+        gate,
     )
-    .await?;
-    if !inserted {
-        tx.rollback().await?;
-        return Ok(JoinEventWrite::Duplicate(stored));
-    }
-    crate::insert_mentions_in_transaction(&mut tx, event, Some(channel_id)).await?;
+    .await?
+    {
+        MemberEventTx::Stored(tx, stored) => (tx, stored),
+        MemberEventTx::Duplicate(stored) => return Ok(JoinEventWrite::Duplicate(stored)),
+    };
 
     if get_channel_tx(tx.conn(), community_id, channel_id)
         .await?
@@ -905,9 +932,8 @@ pub enum MemberRemoveEventWrite {
 /// event's author as the actor, in one transaction, under the rules of
 /// [`remove_member`].
 ///
-/// Locks, in order: the channel's write gate (under `gate`), then the
-/// membership lock. A refusal decided under the lock
-/// ([`DbError::AccessDenied`]) stores nothing.
+/// Locks and duplicates as in [`begin_member_event_write`]. A refusal
+/// decided under the lock ([`DbError::AccessDenied`]) stores nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn remove_member_with_event(
     pool: &PgPool,
@@ -923,28 +949,20 @@ pub(crate) async fn remove_member_with_event(
     // Immutable, and read before the lock for the reason in `remove_member`.
     let actor_is_agent_owner = pubkey != actor.as_slice()
         && crate::user::is_agent_owner(pool, community_id, pubkey, &actor).await?;
-    let mut tx = crate::begin_community_event_write_transaction(
+    let (mut tx, stored) = match begin_member_event_write(
         pool,
+        push_enqueue,
         community_id,
-        crate::observability::WriterOperation::EventWrite,
-    )
-    .await?;
-    tx.set_push_enqueue(push_enqueue);
-    crate::lifecycle::lock_write_gates(&mut tx, gate, &[channel_id]).await?;
-    acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
-
-    let (stored, inserted) = crate::event::insert_event_with_thread_metadata_tx(
-        &mut tx,
+        channel_id,
         event,
-        Some(channel_id),
         thread_meta,
+        gate,
     )
-    .await?;
-    if !inserted {
-        tx.rollback().await?;
-        return Ok(MemberRemoveEventWrite::Duplicate(stored));
-    }
-    crate::insert_mentions_in_transaction(&mut tx, event, Some(channel_id)).await?;
+    .await?
+    {
+        MemberEventTx::Stored(tx, stored) => (tx, stored),
+        MemberEventTx::Duplicate(stored) => return Ok(MemberRemoveEventWrite::Duplicate(stored)),
+    };
 
     let outcome =
         match remove_member_on(&mut tx, channel_id, pubkey, &actor, actor_is_agent_owner).await {
@@ -2280,6 +2298,8 @@ impl Db {
     }
 
     /// Adds a member to a channel.
+    ///
+    /// Ungated test fixture, no production caller: use [`Db::put_members_with_event`].
     #[datastore_span(name = "add_member", system = "postgresql")]
     pub async fn add_member(
         &self,
@@ -2302,6 +2322,8 @@ impl Db {
 
     /// Adds a member or changes a role, deciding the role from the request
     /// and current channel state (see [`put_member`]).
+    ///
+    /// Ungated test fixture, no production caller: use [`Db::put_members_with_event`].
     #[datastore_span(name = "put_member", system = "postgresql")]
     pub async fn put_member(
         &self,

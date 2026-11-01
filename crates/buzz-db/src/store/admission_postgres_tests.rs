@@ -318,9 +318,16 @@ async fn workflow_writers_require_application_admission() {
             .expect_err("workflow create must reject"),
         );
         assert_fenced(
-            super::workflow::create_workflow_run(&db.pool, *community, Uuid::new_v4(), None, None)
-                .await
-                .expect_err("workflow run create must reject"),
+            super::workflow::create_workflow_run(
+                &db.pool,
+                *community,
+                Uuid::new_v4(),
+                None,
+                None,
+                crate::ArchiveGate::Exempt,
+            )
+            .await
+            .expect_err("workflow run create must reject"),
         );
         assert_fenced(
             super::workflow::claim_scheduled_workflow_fire(
@@ -328,6 +335,7 @@ async fn workflow_writers_require_application_admission() {
                 *community,
                 Uuid::new_v4(),
                 chrono::Utc::now(),
+                crate::ArchiveGate::Exempt,
             )
             .await
             .expect_err("schedule claim must reject"),

@@ -599,7 +599,7 @@ fn parse_operator_listener_delivery_urls(
 }
 
 /// Default for `BUZZ_LIFECYCLE_MAX_SUBTREE_CHANNELS`.
-pub const DEFAULT_LIFECYCLE_SUBTREE_CHANNELS: usize = 1000;
+pub const DEFAULT_LIFECYCLE_SUBTREE_CHANNELS: usize = 250;
 /// Upper bound for `BUZZ_LIFECYCLE_MAX_SUBTREE_CHANNELS`. A guarded request
 /// takes two advisory locks per channel, which share the server lock table.
 pub const MAX_LIFECYCLE_SUBTREE_CHANNELS: usize = 1000;
@@ -2120,6 +2120,43 @@ mod tests {
         .admin
         .expect("admin surface is configured");
         assert!(matches!(admin.auth, crate::config::AdminAuth::Nip98));
+    }
+
+    /// The subtree limit defaults to 250 and accepts 1..=1000. Mutation:
+    /// change the default or either bound and a row fails.
+    #[test]
+    fn lifecycle_subtree_limit_defaults_to_250_and_is_bounded() {
+        const KEY: &str = "BUZZ_LIFECYCLE_MAX_SUBTREE_CHANNELS";
+        let _guards = env_guards();
+        let previous = std::env::var_os(KEY);
+        let mut results = Vec::new();
+        for value in [None, Some("1"), Some("1000"), Some("0"), Some("1001")] {
+            match value {
+                Some(value) => std::env::set_var(KEY, value),
+                None => std::env::remove_var(KEY),
+            }
+            let limit = Config::from_env().map(|config| config.lifecycle_max_subtree_channels);
+            results.push((value, limit));
+        }
+        match previous {
+            Some(value) => std::env::set_var(KEY, value),
+            None => std::env::remove_var(KEY),
+        }
+        for (value, limit) in results {
+            match value {
+                None => assert_eq!(limit.ok(), Some(250), "unset"),
+                Some("1") => assert_eq!(limit.ok(), Some(1)),
+                Some("1000") => assert_eq!(limit.ok(), Some(1000)),
+                Some(value) => assert!(
+                    matches!(
+                        limit,
+                        Err(ConfigError::InvalidValue(ref message))
+                            if message == "BUZZ_LIFECYCLE_MAX_SUBTREE_CHANNELS must be 1..=1000"
+                    ),
+                    "{value}: {limit:?}"
+                ),
+            }
+        }
     }
 
     #[test]

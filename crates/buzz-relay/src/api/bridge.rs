@@ -2759,11 +2759,29 @@ pub async fn workflow_webhook(
         .await
         .map_err(|_| not_found("workflow not found"))?;
 
+    // Archived or unbound answers the same 404 as the lookups above.
     let run_id = state
         .db
-        .create_workflow_run(community_id, id, None, trigger_ctx_json.as_ref())
+        .create_workflow_run(
+            community_id,
+            id,
+            None,
+            trigger_ctx_json.as_ref(),
+            buzz_db::ArchiveGate::Refuse,
+        )
         .await
-        .map_err(|e| super::internal_error(&format!("db error: {e}")))?;
+        .map_err(|e| match e {
+            buzz_db::DbError::AccessDenied(reason)
+                if reason == buzz_db::lifecycle::CHANNEL_ARCHIVED
+                    || reason == buzz_db::workflow::WORKFLOW_UNBOUND =>
+            {
+                not_found("workflow not found")
+            }
+            buzz_db::DbError::LifecycleConflict => {
+                api_error(StatusCode::CONFLICT, "conflict: lifecycle changed")
+            }
+            e => super::internal_error(&format!("db error: {e}")),
+        })?;
 
     // Spawn workflow execution asynchronously.
     let engine = Arc::clone(&state.workflow_engine);
