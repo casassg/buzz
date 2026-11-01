@@ -778,7 +778,9 @@ pub(super) async fn repo_archive_state(
     tx.rollback().await?;
     match gated {
         Ok(_) => Ok(LastCheck::Bound(false)),
-        Err(error) if crate::handlers::ingest::is_archived_refusal(&error) => {
+        Err(buzz_db::DbError::AccessDenied(reason))
+            if reason == buzz_db::lifecycle::CHANNEL_ARCHIVED =>
+        {
             Ok(LastCheck::Bound(true))
         }
         Err(error) => Err(error),
