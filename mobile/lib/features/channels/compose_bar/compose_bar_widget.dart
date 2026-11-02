@@ -526,18 +526,8 @@ class ComposeBar extends HookConsumerWidget {
     void triggerChannel() => _insertTriggerAtCursor(controller, focusNode, '#');
 
     // Insert a selected emoji at the cursor without replacing the draft.
-    void insertEmoji(String emoji) {
-      final text = controller.text;
-      final selection = controller.selection;
-      final cursor = selection.isValid
-          ? selection.baseOffset.clamp(0, text.length)
-          : text.length;
-      controller.value = TextEditingValue(
-        text: text.replaceRange(cursor, cursor, emoji),
-        selection: TextSelection.collapsed(offset: cursor + emoji.length),
-      );
-      focusNode.requestFocus();
-    }
+    void insertEmoji(String emoji) =>
+        _insertAtCursor(controller, focusNode, emoji);
 
     void clearComposer() {
       draftRevision.value += 1;
@@ -579,16 +569,9 @@ class ComposeBar extends HookConsumerWidget {
       // Resolved before any await: see
       // `_reportSendCancelledByCommunitySwitch`.
       final messenger = ScaffoldMessenger.maybeOf(context);
-      final command = enableSlashCommands
-          ? slashRegistry.recognize(text)
-          : null;
+      final command = slash.recognize(text);
       if (command != null && hasAttachments) {
-        messenger?.showSnackBar(
-          const SnackBar(
-            content: Text('Commands cannot be sent with attachments'),
-          ),
-        );
-        return;
+        return _rejectSlashCommandAttachments(messenger);
       }
 
       // Extract pubkeys for mentions present in the final text.
@@ -951,36 +934,13 @@ class ComposeBar extends HookConsumerWidget {
     }
 
     // Wrap (or insert) markdown formatting around the current selection.
-    void applyFormat(String prefix, [String? suffix]) {
-      suffix ??= prefix;
-      final text = controller.text;
-      final sel = controller.selection;
-      if (!sel.isValid) return;
-
-      isModifyingText.value = true;
-      try {
-        if (sel.isCollapsed) {
-          final offset = sel.baseOffset;
-          final updated =
-              '${text.substring(0, offset)}$prefix$suffix${text.substring(offset)}';
-          controller.text = updated;
-          controller.selection = TextSelection.collapsed(
-            offset: offset + prefix.length,
-          );
-        } else {
-          final selected = text.substring(sel.start, sel.end);
-          final updated =
-              '${text.substring(0, sel.start)}$prefix$selected$suffix${text.substring(sel.end)}';
-          controller.text = updated;
-          controller.selection = TextSelection.collapsed(
-            offset: sel.start + prefix.length + selected.length + suffix.length,
-          );
-        }
-      } finally {
-        isModifyingText.value = false;
-      }
-      focusNode.requestFocus();
-    }
+    void applyFormat(String prefix, [String? suffix]) => _applyFormat(
+      controller,
+      focusNode,
+      isModifyingText,
+      prefix,
+      suffix ?? prefix,
+    );
 
     void chooseAttachment(
       Future<void> Function() choose, {

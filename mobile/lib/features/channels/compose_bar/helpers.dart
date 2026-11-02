@@ -324,6 +324,59 @@ void _insertTriggerAtCursor(
   focusNode.requestFocus();
 }
 
+void _insertAtCursor(
+  TextEditingController controller,
+  FocusNode focusNode,
+  String insert,
+) {
+  final text = controller.text;
+  final selection = controller.selection;
+  final cursor = selection.isValid
+      ? selection.baseOffset.clamp(0, text.length)
+      : text.length;
+  controller.value = TextEditingValue(
+    text: text.replaceRange(cursor, cursor, insert),
+    selection: TextSelection.collapsed(offset: cursor + insert.length),
+  );
+  focusNode.requestFocus();
+}
+
+void _applyFormat(
+  TextEditingController controller,
+  FocusNode focusNode,
+  ObjectRef<bool> isModifyingText,
+  String prefix,
+  String suffix,
+) {
+  final text = controller.text;
+  final sel = controller.selection;
+  if (!sel.isValid) return;
+
+  isModifyingText.value = true;
+  try {
+    if (sel.isCollapsed) {
+      final offset = sel.baseOffset;
+      final updated =
+          '${text.substring(0, offset)}$prefix$suffix${text.substring(offset)}';
+      controller.text = updated;
+      controller.selection = TextSelection.collapsed(
+        offset: offset + prefix.length,
+      );
+    } else {
+      final selected = text.substring(sel.start, sel.end);
+      final updated =
+          '${text.substring(0, sel.start)}$prefix$selected$suffix${text.substring(sel.end)}';
+      controller.text = updated;
+      controller.selection = TextSelection.collapsed(
+        offset: sel.start + prefix.length + selected.length + suffix.length,
+      );
+    }
+  } finally {
+    isModifyingText.value = false;
+  }
+  focusNode.requestFocus();
+}
+
 /// Outcome of the non-member mention prompt. `null` (dialog dismissed)
 /// cancels the send and keeps the draft.
 enum _NonMemberMentionChoice { invite, sendWithoutInviting }

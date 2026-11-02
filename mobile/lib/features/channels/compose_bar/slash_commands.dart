@@ -3,6 +3,7 @@ part of '../compose_bar.dart';
 typedef _SlashComposer = ({
   List<SlashCommand> suggestions,
   void Function(SlashCommand) select,
+  SlashInvocation<SlashCommand>? Function(String text) recognize,
   Future<bool> Function({
     required SlashInvocation<SlashCommand> invocation,
     required List<MentionCandidate> mentions,
@@ -96,5 +97,16 @@ _SlashComposer _useSlashCommands({
     );
   }
 
-  return (suggestions: suggestions, select: select, run: run);
+  return (
+    suggestions: suggestions,
+    select: select,
+    recognize: (text) => enabled ? slashRegistry.recognize(text) : null,
+    run: run,
+  );
+}
+
+void _rejectSlashCommandAttachments(ScaffoldMessengerState? messenger) {
+  messenger?.showSnackBar(
+    const SnackBar(content: Text('Commands cannot be sent with attachments')),
+  );
 }
