@@ -1,5 +1,8 @@
+import 'package:buzz/features/channels/default_agent_launcher.dart';
+import 'package:buzz/shared/me/default_agent.dart';
 import 'package:buzz/features/channels/compose_bar.dart';
 import 'package:buzz/features/channels/send_message_provider.dart';
+import 'package:buzz/features/channels/agent_reply_handoff.dart';
 import 'package:buzz/features/channels/me/me_messages_provider.dart';
 import 'package:buzz/shared/me/me_assistants.dart';
 import 'package:buzz/shared/me/me_sync.dart';
@@ -59,9 +62,7 @@ import 'package:buzz/features/channels/message_content.dart';
 import 'package:buzz/features/channels/mobile_huddle_controller.dart';
 import 'package:buzz/features/channels/reaction_row.dart';
 import 'package:buzz/features/channels/message_mention_pill.dart';
-import 'package:buzz/features/channels/agent_activity/agent_activity_sheet.dart';
 import 'package:buzz/features/channels/thread_detail_page.dart';
-import 'package:buzz/features/channels/working_now_sheet.dart';
 import 'package:buzz/features/channels/thread_replies_provider.dart';
 import 'package:buzz/features/channels/timeline_message.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
@@ -80,6 +81,7 @@ import 'package:buzz/shared/mentions/agent_identity_provider.dart';
 import 'package:buzz/shared/huddle/huddle.dart';
 import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
+import 'package:buzz/shared/widgets/avatar_shape.dart';
 import 'package:buzz/shared/widgets/app_list_card.dart';
 import 'package:buzz/shared/widgets/avatar_image.dart';
 import 'package:buzz/shared/widgets/frosted_app_bar.dart';
@@ -236,6 +238,7 @@ NostrEvent _edit({
 );
 
 Widget _buildTestable({
+  String? bestie,
   bool useRealChannelProviders = false,
   ProfileNotifier? profileNotifier,
   String? signingPubkey,
@@ -306,6 +309,8 @@ Widget _buildTestable({
   return ProviderScope(
     retry: providerRetry ?? (disableRetries ? (_, _) => null : null),
     overrides: [
+      if (bestie != null)
+        defaultAgentProvider.overrideWith((ref) => Stream.value(bestie)),
       if (sender != null) sendMessageProvider.overrideWithValue(sender),
       if (soloSender != null) ...[
         meSendMessageProvider.overrideWithValue(soloSender),
@@ -578,6 +583,81 @@ double? effectiveFontSizeForText(
 }
 
 void main() {
+  for (final fromLauncher in [false, true]) {
+    testWidgets(
+      'Bestie DM shows replies inline and sends at top level: launcher=$fromLauncher',
+      (tester) async {
+        final sender = _RecordingOrdinarySender();
+        final dm = Channel(
+          id: _channelId,
+          name: 'Bestie',
+          channelType: 'dm',
+          visibility: 'private',
+          description: '',
+          createdBy: 'self',
+          createdAt: DateTime(2026),
+          memberCount: 2,
+          participantPubkeys: const ['self', 'agent'],
+          isMember: true,
+        );
+        await tester.pumpWidget(
+          _buildTestable(
+            personalChat: true,
+            signingPubkey: 'self',
+            bestie: 'agent',
+            organization: Stream.value(const MeGroups()),
+            channel: dm,
+            soloSender: sender,
+            messages: [
+              _textMsg(
+                id: threadIdRoot,
+                pubkey: 'self',
+                content: 'Original question',
+              ),
+              _textMsg(
+                id: threadIdA,
+                pubkey: 'agent',
+                content: 'Existing threaded answer',
+                createdAt: 1001,
+                extraTags: [
+                  ['e', threadIdRoot, '', 'root'],
+                ],
+              ),
+            ],
+            home: fromLauncher
+                ? Scaffold(body: DefaultAgentLauncher(onChooseAgent: () {}))
+                : ChannelDetailPage(
+                    channel: dm,
+                    continuousConversation: true,
+                    initialMessageId: threadIdA,
+                    initialThreadRootId: threadIdRoot,
+                  ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        if (fromLauncher) {
+          await tester.tap(find.byType(IconButton));
+          await tester.pumpAndSettle();
+        }
+        expect(find.text('Existing threaded answer'), findsOneWidget);
+        expect(find.byType(ThreadDetailPage), findsNothing);
+        final row = find.byKey(const ValueKey('message-row-$threadIdRoot'));
+        await tester.tap(row);
+        await tester.pumpAndSettle();
+        expect(find.byType(ThreadDetailPage), findsNothing);
+        await tester.drag(row, const Offset(220, 0));
+        await tester.pumpAndSettle();
+        expect(find.byType(ThreadDetailPage), findsNothing);
+        await tester
+            .widget<ComposeBar>(find.byType(ComposeBar))
+            .onSend('Continue here', []);
+        expect(sender.sent, ['Continue here']);
+        expect(sender.parents, [null]);
+        expect(sender.channels.single?.isDm, isTrue);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
   testWidgets(
     'refresh replaces stale Solo details before opening and sending',
     (tester) async {
@@ -2146,7 +2226,7 @@ void main() {
       },
     );
 
-    testWidgets('uses known media shapes in the reconnect shimmer', (
+    testWidgets('keeps the loaded timeline visible during reconnect', (
       tester,
     ) async {
       final relaySession = _ReconnectingRelaySession();
@@ -2175,21 +2255,21 @@ void main() {
       await tester.pump(const Duration(seconds: 3));
       expect(
         tester.widget<SkeletonReveal>(find.byType(SkeletonReveal)).loading,
-        isTrue,
+        isFalse,
       );
       expect(
         tester
             .widget<Opacity>(find.byKey(const Key('skeleton-reveal-content')))
             .opacity,
-        0,
+        1,
       );
       expect(
-        find.byKey(
-          const ValueKey(
-            'message-skeleton-image:https://example.com/loading.jpg',
-          ),
-        ),
-        findsOneWidget,
+        tester
+            .widget<Opacity>(
+              find.byKey(const Key('skeleton-reveal-placeholder')),
+            )
+            .opacity,
+        0,
       );
       relaySession.connect();
       await tester.pumpAndSettle();
@@ -2237,6 +2317,65 @@ void main() {
         'Reconnecting',
       );
     });
+
+    testWidgets(
+      'shows the title refresh bar while a loaded timeline reconnects',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+        addTearDown(() => debugDefaultTargetPlatformOverride = null);
+        final relaySession = _ReconnectingRelaySession(
+          initialStatus: SessionStatus.connected,
+        );
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [
+              _textMsg(
+                id: 'msg1',
+                pubkey: 'alice',
+                content: 'Existing message',
+              ),
+            ],
+            relaySessionNotifier: relaySession,
+          ),
+        );
+        await tester.pumpAndSettle();
+        final navigationBar = find.byWidgetPredicate(
+          (w) => w is UiKitView && w.viewType == 'buzz/ios_navigation_bar',
+        );
+        final view = tester.widget<UiKitView>(navigationBar);
+        Map<Object?, Object?> payload = view.creationParams! as Map;
+        expect(payload['titleRefreshing'], isFalse);
+        const channel = MethodChannel('buzz/ios_navigation_bar/198');
+        tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          channel,
+          (call) async {
+            if (call.method == 'configure') payload = call.arguments as Map;
+            return null;
+          },
+        );
+        addTearDown(
+          () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+            channel,
+            null,
+          ),
+        );
+        view.onPlatformViewCreated!(198);
+        await tester.pump();
+
+        relaySession.setReconnecting();
+        await tester.pump();
+        expect(payload['titleRefreshing'], isTrue);
+        expect(
+          payload['titleRefreshColor'],
+          ChatColors.of(tester.element(navigationBar)).outgoing.toARGB32(),
+        );
+
+        relaySession.connect();
+        await tester.pumpAndSettle();
+        expect(payload['titleRefreshing'], isFalse);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
 
     testWidgets('keeps loaded forum content visible during reconnect', (
       tester,
@@ -7903,8 +8042,8 @@ void main() {
           find.byKey(const ValueKey('huddle-speaking-halo-desktop')),
         );
         final speakingHaloDecoration =
-            speakingHalo.decoration! as BoxDecoration;
-        expect(speakingHaloDecoration.border, isNull);
+            speakingHalo.decoration! as ShapeDecoration;
+        expect(speakingHaloDecoration.shape, const CircleBorder());
         expect(speakingHaloDecoration.color?.a, closeTo(0.07, 0.001));
         await tester.pump(const Duration(milliseconds: 70));
         final mediumScaleMidTransition = tester
@@ -8101,7 +8240,12 @@ void main() {
 
         await tester.tap(find.byKey(const ValueKey('huddle-minimize')));
         await tester.pumpAndSettle();
-        expect(hapticCalls, hasLength(4));
+        expect(
+          hapticCalls.where(
+            (call) => call.arguments == 'HapticFeedbackType.selectionClick',
+          ),
+          hasLength(4),
+        );
         expect(hapticCalls.last.arguments, 'HapticFeedbackType.selectionClick');
         expect(find.widgetWithText(FilledButton, 'Open'), findsOneWidget);
         expect(
@@ -8162,14 +8306,24 @@ void main() {
           find.byKey(const ValueKey('huddle-drawer-speaker-toggle')),
         );
         await tester.pump();
-        expect(hapticCalls, hasLength(5));
+        expect(
+          hapticCalls.where(
+            (call) => call.arguments == 'HapticFeedbackType.selectionClick',
+          ),
+          hasLength(5),
+        );
         expect(hapticCalls.last.arguments, 'HapticFeedbackType.selectionClick');
 
         await tester.tap(
           find.byKey(const ValueKey('huddle-drawer-mute-toggle')),
         );
         await tester.pump();
-        expect(hapticCalls, hasLength(6));
+        expect(
+          hapticCalls.where(
+            (call) => call.arguments == 'HapticFeedbackType.selectionClick',
+          ),
+          hasLength(6),
+        );
         expect(hapticCalls.last.arguments, 'HapticFeedbackType.selectionClick');
         expect(
           tester
@@ -8214,7 +8368,12 @@ void main() {
         }
         await tester.tap(find.byKey(const ValueKey('huddle-drawer-expand')));
         await tester.pumpAndSettle();
-        expect(hapticCalls, hasLength(7));
+        expect(
+          hapticCalls.where(
+            (call) => call.arguments == 'HapticFeedbackType.selectionClick',
+          ),
+          hasLength(7),
+        );
         expect(hapticCalls.last.arguments, 'HapticFeedbackType.selectionClick');
         expect(find.byKey(const ValueKey('huddle-minimize')), findsOneWidget);
         expect(
@@ -8230,11 +8389,21 @@ void main() {
 
         await tester.tap(find.byKey(const ValueKey('huddle-minimize')));
         await tester.pumpAndSettle();
-        expect(hapticCalls, hasLength(8));
+        expect(
+          hapticCalls.where(
+            (call) => call.arguments == 'HapticFeedbackType.selectionClick',
+          ),
+          hasLength(8),
+        );
         expect(hapticCalls.last.arguments, 'HapticFeedbackType.selectionClick');
         await tester.tap(find.byKey(const ValueKey('huddle-drawer-leave')));
         await tester.pump();
-        expect(hapticCalls, hasLength(9));
+        expect(
+          hapticCalls.where(
+            (call) => call.arguments == 'HapticFeedbackType.selectionClick',
+          ),
+          hasLength(9),
+        );
         expect(hapticCalls.last.arguments, 'HapticFeedbackType.selectionClick');
         expect(
           tester
@@ -11061,30 +11230,85 @@ void main() {
   );
 
   group('Typing indicator', () {
-    // Desktop's conversation activity above the composer, by its spoken
-    // status: the user's agents working, then everyone else typing.
-    Finder activityStatus(String label) =>
-        find.bySemanticsLabel(RegExp('^${RegExp.escape(label)}\$'));
+    testWidgets('Me reply consumes typing and grows its pending bubble', (
+      tester,
+    ) async {
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final prompt = _textMsg(
+        id: threadIdRoot,
+        pubkey: 'self',
+        content: 'Hello',
+        createdAt: now - 3,
+      );
+      final typing = _FakeTypingNotifier(const []);
+      await tester.pumpWidget(
+        _buildTestable(
+          personalChat: true,
+          messages: [prompt],
+          typingNotifier: typing,
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+      typing.setEntries([
+        TypingEntry(
+          pubkey: 'alice',
+          threadHeadId: threadIdRoot,
+          expiresAtMs: (now - 1) * 1000 + 8000,
+        ),
+      ]);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(find.byKey(const ValueKey('agent-typing-bubble')), findsOneWidget);
+      final container = ProviderScope.containerOf(
+        tester.element(find.byType(ChannelDetailPage)),
+      );
+      final messages =
+          container.read(meMessagesProvider(_channelId).notifier)
+              as _FakeMessagesNotifier;
+      messages.setMessages([
+        prompt,
+        _textMsg(
+          id: 'reply',
+          pubkey: 'alice',
+          content: 'Here is the reply',
+          createdAt: now,
+          extraTags: [
+            ['e', threadIdRoot, '', 'reply'],
+          ],
+        ),
+      ]);
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey('inline-agent-typing-alice')),
+        findsNothing,
+      );
+      final handoff = tester.widget<AgentReplyHandoff>(
+        find.byKey(const ValueKey('reply-handoff-reply')),
+      );
+      expect(handoff.animate, isTrue);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('agent-typing-bubble')), findsNothing);
+      expect(findRichText('Here is the reply'), findsOneWidget);
+    });
 
-    // As on desktop, thread typing shows above the channel's composer only
-    // for the user's own agents, in channels and DMs alike. Me counts all of
-    // its thread typing as its own.
     for (final scenario in [
-      (name: 'Me, a person', personal: true, dm: false, owned: false),
-      (name: 'channel, a person', personal: false, dm: false, owned: false),
-      (name: 'channel, your agent', personal: false, dm: false, owned: true),
-      (name: 'DM, another agent', personal: false, dm: true, owned: false),
-      (name: 'DM, your agent', personal: false, dm: true, owned: true),
+      (personal: true, dm: false, agent: true, group: false, visible: true),
+      (personal: false, dm: false, agent: true, group: false, visible: false),
+      (personal: false, dm: true, agent: true, group: false, visible: true),
+      (personal: false, dm: true, agent: false, group: false, visible: false),
+      (personal: false, dm: true, agent: true, group: true, visible: true),
     ]) {
-      testWidgets('thread typing follows desktop scope: ${scenario.name}', (
+      testWidgets('reply-scoped typing follows conversation scope: $scenario', (
         tester,
       ) async {
         final typing = _FakeTypingNotifier(const []);
         await tester.pumpWidget(
           _buildTestable(
             personalChat: scenario.personal,
-            knownAgentPubkeys: const {'alice'},
-            inventoryAgents: scenario.owned ? const {'alice'} : const {},
+            knownAgentPubkeys: scenario.agent ? {'alice'} : <String>{},
             channel: scenario.dm
                 ? Channel(
                     id: _channelId,
@@ -11094,8 +11318,12 @@ void main() {
                     description: '',
                     createdBy: 'self',
                     createdAt: DateTime(2025),
-                    memberCount: 2,
-                    participantPubkeys: const ['self', 'alice'],
+                    memberCount: scenario.group ? 3 : 2,
+                    participantPubkeys: [
+                      'self',
+                      'alice',
+                      if (scenario.group) 'bob',
+                    ],
                     isMember: true,
                   )
                 : null,
@@ -11110,16 +11338,6 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        if (scenario.owned) {
-          // Until the inventory loads, an agent never shows as a person.
-          typing.setEntries(const [
-            TypingEntry(pubkey: 'alice', expiresAtMs: 9999999999999),
-          ]);
-          await tester.pump();
-          expect(find.text('Alice is typing'), findsNothing);
-          await tester.pumpAndSettle();
-          expect(activityStatus('Alice is working'), findsOneWidget);
-        }
         typing.setEntries(const [
           TypingEntry(
             pubkey: 'alice',
@@ -11128,21 +11346,15 @@ void main() {
           ),
         ]);
         await tester.pumpAndSettle();
-        final status = scenario.owned
-            ? 'Alice is working'
-            : scenario.personal
-            ? 'Alice is typing'
-            : null;
         expect(
-          status == null
-              ? find.byKey(const ValueKey('conversation-activity'))
-              : activityStatus(status),
-          status == null ? findsNothing : findsOneWidget,
+          find.byKey(const ValueKey('inline-agent-typing-alice')),
+          scenario.visible ? findsOneWidget : findsNothing,
         );
+        expect(find.text('Alice is typing…'), findsNothing);
         typing.setEntries(const []);
         await tester.pumpAndSettle();
         expect(
-          find.byKey(const ValueKey('conversation-activity')),
+          find.byKey(const ValueKey('inline-agent-typing-alice')),
           findsNothing,
         );
       });
@@ -11198,9 +11410,10 @@ void main() {
               widget.painter.runtimeType.toString() == '_ReplyConnector',
         ),
       );
-      final activity = find.byKey(const ValueKey('conversation-activity'));
-      final agentsButton = find.byKey(
-        const ValueKey('conversation-activity-agents'),
+      // The channel's typing row, by its line of the spoken status. The
+      // newest timeline item merges its day label into the same node.
+      Finder typingRow(String label) => find.bySemanticsLabel(
+        RegExp('^${RegExp.escape(label)}\$', multiLine: true),
       );
       expect(row, findsNothing);
 
@@ -11216,10 +11429,9 @@ void main() {
       ]);
       await tester.pumpAndSettle();
       expect(row, findsNothing);
-      expect(activity, findsNothing);
+      expect(find.byKey(const ValueKey('agent-typing-bubble')), findsNothing);
 
       // As on desktop, at most two working avatars show, then a count.
-      // Alice types in the channel itself.
       typing.setEntries([
         for (final pubkey in ['morty', 'summer', 'jerry', 'rick'])
           TypingEntry(
@@ -11227,68 +11439,14 @@ void main() {
             threadHeadId: threadIdRoot,
             expiresAtMs: (now + 8) * 1000,
           ),
-        TypingEntry(pubkey: 'alice', expiresAtMs: (now + 8) * 1000),
       ]);
       await tester.pumpAndSettle();
       expect(
         find.bySemanticsLabel('View thread: 3 agents are working'),
         findsOneWidget,
       );
-      // As on desktop, the composer shows them too, sorted by key, beside
-      // the people typing in the channel.
-      expect(
-        activityStatus('Jerry, Morty, Summer are working. Alice is typing'),
-        findsOneWidget,
-      );
-      expect(
-        find.bySemanticsLabel('Activity: 3 agents working'),
-        findsOneWidget,
-      );
-      expect(
-        find.descendant(of: activity, matching: find.text('Alice is typing')),
-        findsOneWidget,
-      );
-
-      // Desktop's "Working now" list names each agent's thread and opens it.
-      await tester.tap(agentsButton);
-      await tester.pumpAndSettle();
-      expect(find.text('Working now'), findsOneWidget);
-      expect(find.text('Thread · morty say hi'), findsNWidgets(3));
-      expect(find.bySemanticsLabel('Open thread for Jerry'), findsOneWidget);
-      expect(find.byTooltip('View Jerry activity'), findsOneWidget);
-      await tester.tap(find.bySemanticsLabel('Open thread for Morty'));
-      await tester.pumpAndSettle();
-      expect(find.text('Working now'), findsNothing);
-      expect(
-        tester
-            .widget<ThreadDetailPage>(find.byType(ThreadDetailPage))
-            .threadHead
-            .id,
-        threadIdRoot,
-      );
-      // In the thread, everyone typing there shows, and Alice does not.
-      expect(
-        activityStatus('Jerry, Morty, Summer are working. Rick is typing'),
-        findsOneWidget,
-      );
-      // The thread is already open, so its rows open each agent's activity.
-      await tester.tap(agentsButton);
-      await tester.pumpAndSettle();
-      expect(find.bySemanticsLabel('View Morty activity'), findsOneWidget);
-      expect(find.bySemanticsLabel('Open thread for Morty'), findsNothing);
-      expect(find.textContaining('Thread ·'), findsNothing);
-      await tester.tap(find.bySemanticsLabel('View Morty activity'));
-      await tester.pumpAndSettle();
-      expect(
-        tester
-            .widget<AgentActivitySheet>(find.byType(AgentActivitySheet))
-            .agentPubkey,
-        'morty',
-      );
-      Navigator.of(tester.element(find.byType(AgentActivitySheet))).pop();
-      await tester.pumpAndSettle();
-      await tester.pageBack();
-      await tester.pumpAndSettle();
+      // As on desktop, the channel's typing row shows them too.
+      expect(typingRow('Morty and 2 others are typing'), findsOneWidget);
       expect(rowAvatars(), ['morty', 'summer']);
       // Working avatars use the agent shape, though no profile names an owner.
       for (final avatar
@@ -11303,7 +11461,11 @@ void main() {
               )
               .first,
         );
-        expect((frame.decoration! as BoxDecoration).shape, BoxShape.rectangle);
+        final shape = (frame.decoration! as ShapeDecoration).shape;
+        expect(
+          shape,
+          avatarShape(isAgent: true, side: (shape as OutlinedBorder).side),
+        );
       }
       // As on desktop, the reply branch waits for a reply.
       expect(connector, findsNothing);
@@ -11332,14 +11494,15 @@ void main() {
         ),
         findsOneWidget,
       );
-      expect(activityStatus('Morty is working'), findsOneWidget);
-      // With no one typing, the status still has a place on screen, so
-      // screen readers can reach and announce it.
+      expect(typingRow('Morty is typing'), findsOneWidget);
       expect(
-        tester.getSemantics(activityStatus('Morty is working')).rect.height,
-        greaterThan(0),
+        tester
+            .widget<AvatarImage>(
+              find.byKey(const ValueKey('inline-agent-typing-morty')),
+            )
+            .isAgent,
+        isTrue,
       );
-      expect(find.bySemanticsLabel('Activity: Morty working'), findsOneWidget);
       expect(
         find.bySemanticsLabel('View thread: Morty is working'),
         findsOneWidget,
@@ -11354,6 +11517,25 @@ void main() {
             .threadHead
             .id,
         threadIdRoot,
+      );
+      // The opened thread shares the inline group, even before its first reply.
+      expect(
+        find.byKey(const ValueKey('typing-avatar-cluster')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('channel-typing-indicator')),
+        findsNothing,
+      );
+      expect(find.byKey(const ValueKey('conversation-activity')), findsNothing);
+      expect(find.text('Morty is typing…'), findsNothing);
+      expect(
+        tester
+            .widget<AvatarImage>(
+              find.byKey(const ValueKey('inline-agent-typing-morty')),
+            )
+            .isAgent,
+        isTrue,
       );
       await tester.pageBack();
       await tester.pumpAndSettle();
@@ -11381,20 +11563,14 @@ void main() {
         find.bySemanticsLabel('View thread: 1 reply. Morty working'),
         findsOneWidget,
       );
-      // Like the row, the composer follows Morty's typing, not his reply.
-      expect(activityStatus('Morty is working'), findsOneWidget);
+      // The reply ends Morty's pending bubble in the channel.
+      expect(typingRow('Morty is typing'), findsNothing);
       // Morty shows once, in the working group, not also as a participant.
       expect(rowAvatars(), ['morty']);
       expect(connector, findsOneWidget);
 
-      // The list closes with the indicator when the last agent stops.
-      await tester.tap(agentsButton);
-      await tester.pumpAndSettle();
-      expect(find.text('Working now'), findsOneWidget);
       typing.setEntries(const []);
       await tester.pumpAndSettle();
-      expect(find.text('Working now'), findsNothing);
-      expect(activity, findsNothing);
       expect(row, findsOneWidget);
       expect(find.byKey(const ValueKey('thread-working-dots')), findsNothing);
       expect(find.bySemanticsLabel('View thread: 1 reply'), findsOneWidget);
@@ -11417,221 +11593,189 @@ void main() {
         find.bySemanticsLabel('View thread: 1 reply. Summer working'),
         findsOneWidget,
       );
-      expect(activityStatus('Summer is working'), findsOneWidget);
-    });
+      expect(typingRow('Summer is typing'), findsOneWidget);
 
-    testWidgets('many agents in many places: every row acts', (tester) async {
-      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      const unloaded = 'feedfacecafebeef';
-      final agents = [for (var i = 1; i <= 6; i++) 'a$i'];
-      await tester.pumpWidget(
-        _buildTestable(
-          messages: [
-            _textMsg(
-              id: threadIdRoot,
-              pubkey: 'self',
-              content: 'check   the\nbuild',
-              createdAt: now - 3,
-            ),
-          ],
-          typing: [
-            for (final pubkey in agents)
-              if (pubkey != 'a2' && pubkey != 'a3')
-                TypingEntry(
-                  pubkey: pubkey,
-                  threadHeadId: threadIdRoot,
-                  expiresAtMs: (now + 60) * 1000,
-                ),
-            // A thread whose root is not in the timeline.
-            TypingEntry(
-              pubkey: 'a2',
-              threadHeadId: unloaded,
-              expiresAtMs: (now + 60) * 1000,
-            ),
-            // Three places.
-            for (final root in [null, threadIdRoot, unloaded])
-              TypingEntry(
-                pubkey: 'a3',
-                threadHeadId: root,
-                expiresAtMs: (now + 60) * 1000,
-              ),
-          ],
-          disableAnimations: true,
-          inventoryAgents: agents.toSet(),
-          users: {
-            for (final pubkey in agents)
-              pubkey: UserProfile(
-                pubkey: pubkey,
-                displayName: 'Agent ${pubkey.substring(1)}',
-              ),
-          },
-        ),
-      );
-      await tester.pumpAndSettle();
-      // As on desktop, four avatars show, then a count.
-      final agentsButton = find.byKey(
-        const ValueKey('conversation-activity-agents'),
-      );
-      expect(
-        find.descendant(of: agentsButton, matching: find.byType(SmallAvatar)),
-        findsNWidgets(4),
-      );
-      expect(
-        find.descendant(of: agentsButton, matching: find.text('+2')),
-        findsOneWidget,
-      );
-      expect(
-        find.bySemanticsLabel('Activity: 6 agents working'),
-        findsOneWidget,
-      );
-
-      Future<void> openList() async {
-        await tester.tap(agentsButton);
-        await tester.pumpAndSettle();
-        expect(find.text('Working now'), findsOneWidget);
-      }
-
-      await openList();
-      expect(
-        find.text('Channel conversation / Thread · check the build / +1 more'),
-        findsOneWidget,
-      );
-      expect(find.text('Thread · feedface'), findsOneWidget);
-      // Several places open the agent's activity, as on desktop.
-      expect(find.bySemanticsLabel('View Agent 3 activity'), findsOneWidget);
-      expect(find.byTooltip('View Agent 3 activity'), findsNothing);
-
-      // The capped sheet scrolls to its last agent, whose row opens its
-      // thread.
-      final last = find.bySemanticsLabel('Open thread for Agent 6');
-      await tester.scrollUntilVisible(
-        last,
-        48,
-        scrollable: find.descendant(
-          of: find.byType(WorkingNowSheet),
-          matching: find.byType(Scrollable),
-        ),
-      );
-      await tester.tap(last);
-      await tester.pumpAndSettle();
-      expect(find.text('Working now'), findsNothing);
-      expect(
-        tester
-            .widget<ThreadDetailPage>(find.byType(ThreadDetailPage))
-            .threadHead
-            .id,
-        threadIdRoot,
-      );
-      await tester.pageBack();
-      await tester.pumpAndSettle();
-
-      // A thread outside the timeline opens by its root, as a desktop link.
-      await openList();
-      await tester.tap(find.bySemanticsLabel('Open thread for Agent 2'));
-      await tester.pumpAndSettle();
-      expect(
-        find.byWidgetPredicate(
-          (widget) =>
-              widget is ChannelDetailPage &&
-              widget.initialThreadRootId == unloaded,
-        ),
-        findsOneWidget,
-      );
-      await tester.pageBack();
-      await tester.pumpAndSettle();
-
-      // Each row's activity button opens that agent's activity.
-      await openList();
-      await tester.tap(find.byTooltip('View Agent 1 activity'));
-      await tester.pumpAndSettle();
-      expect(find.text('Working now'), findsNothing);
-      expect(
-        tester
-            .widget<AgentActivitySheet>(find.byType(AgentActivitySheet))
-            .agentPubkey,
-        'a1',
-      );
-    });
-
-    testWidgets("Me opens a lone agent's activity directly", (tester) async {
-      await tester.pumpWidget(
-        _buildTestable(
-          personalChat: true,
-          messages: [_textMsg(id: 'prompt', pubkey: 'self', content: 'Hi')],
-          typing: [
-            TypingEntry(
-              pubkey: 'morty',
-              threadHeadId: 'prompt',
-              expiresAtMs: DateTime.now().millisecondsSinceEpoch + 60000,
-            ),
-          ],
-          disableAnimations: true,
-          inventoryAgents: const {'morty'},
-          users: const {
-            'morty': UserProfile(pubkey: 'morty', displayName: 'Morty'),
-          },
-        ),
-      );
-      await tester.pumpAndSettle();
-      await tester.tap(
-        find.byKey(const ValueKey('conversation-activity-agents')),
-      );
-      await tester.pumpAndSettle();
-      expect(find.text('Working now'), findsNothing);
-      expect(
-        tester
-            .widget<AgentActivitySheet>(find.byType(AgentActivitySheet))
-            .agentPubkey,
-        'morty',
-      );
-    });
-
-    for (final (count, text) in [
-      (1, 'Alice is typing'),
-      (2, 'Alice, Bob are typing'),
-      (3, 'Alice, Bob and 1 others are typing'),
-    ]) {
-      testWidgets('people typing show beside the composer: $count', (
-        tester,
-      ) async {
-        await tester.pumpWidget(
-          _buildTestable(
-            messages: [],
-            typing: [
-              for (final pubkey in ['alice', 'bob', 'carol'].take(count))
-                TypingEntry(
-                  pubkey: pubkey,
-                  expiresAtMs: DateTime.now().millisecondsSinceEpoch + 8000,
-                ),
-            ],
-            users: const {
-              'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
-              'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
-              'carol': UserProfile(pubkey: 'carol', displayName: 'Carol'),
-            },
-            disableAnimations: true,
+      // With replies present, mixed human/agent typing shares one group after
+      // the last reply, and Back returns to the working reply link.
+      typing.setEntries([
+        for (final pubkey in ['summer', 'alice'])
+          TypingEntry(
+            pubkey: pubkey,
+            threadHeadId: threadIdRoot,
+            expiresAtMs: (now + 120) * 1000,
           ),
-        );
-        await tester.pumpAndSettle();
+      ]);
+      await tester.pumpAndSettle();
+      await tester.tap(row);
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('typing-avatar-cluster')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('inline-agent-typing-alice')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('inline-agent-typing-summer')),
+        findsOneWidget,
+      );
+      expect(
+        tester
+            .getTopLeft(find.byKey(const ValueKey('typing-avatar-cluster')))
+            .dy,
+        greaterThan(
+          tester
+              .getBottomLeft(
+                find.descendant(
+                  of: find.byKey(const ValueKey('thread-message-group-reply')),
+                  matching: findRichText('hi'),
+                ),
+              )
+              .dy,
+        ),
+      );
+      typing.setEntries(const []);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('typing-avatar-cluster')), findsNothing);
+      await tester.pageBack();
+      await tester.pumpAndSettle();
+      expect(find.bySemanticsLabel('View thread: 1 reply'), findsOneWidget);
+    });
 
-        // Desktop's strings.
-        expect(activityStatus(text), findsOneWidget);
-        expect(find.text(text), findsOneWidget);
-        // Readable on the pill's fill in every theme.
-        expect(
-          tester.widget<Text>(find.text(text)).style?.color,
-          Theme.of(tester.element(find.text(text))).colorScheme.onSurface,
-        );
-        expect(
-          find.byKey(const ValueKey('agent-typing-dot-2')),
-          findsOneWidget,
-        );
-        expect(
-          find.byKey(const ValueKey('conversation-activity-agents')),
-          findsNothing,
-        );
-      });
-    }
+    testWidgets('shows single typer', (tester) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [],
+          typing: [
+            TypingEntry(
+              pubkey: 'alice',
+              expiresAtMs: DateTime.now().millisecondsSinceEpoch + 8000,
+            ),
+          ],
+          users: {
+            'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+
+      expect(
+        find.byKey(const ValueKey('inline-agent-typing-alice')),
+        findsOneWidget,
+      );
+      expect(find.byKey(const ValueKey('agent-typing-dot-2')), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('channel-typing-indicator')),
+        findsNothing,
+      );
+    });
+
+    testWidgets('shows two typers', (tester) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [],
+          typing: [
+            TypingEntry(
+              pubkey: 'alice',
+              expiresAtMs: DateTime.now().millisecondsSinceEpoch + 8000,
+            ),
+            TypingEntry(
+              pubkey: 'bob',
+              expiresAtMs: DateTime.now().millisecondsSinceEpoch + 8000,
+            ),
+          ],
+          users: {
+            'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            'bob': const UserProfile(pubkey: 'bob', displayName: 'Bob'),
+          },
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+
+      expect(find.byKey(const ValueKey('agent-typing-dot-2')), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('inline-agent-typing-alice')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('inline-agent-typing-bob')),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('shares one bubble among three typers', (tester) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [],
+          typing: [
+            TypingEntry(
+              pubkey: 'alice',
+              expiresAtMs: DateTime.now().millisecondsSinceEpoch + 8000,
+            ),
+            TypingEntry(
+              pubkey: 'bob',
+              expiresAtMs: DateTime.now().millisecondsSinceEpoch + 8000,
+            ),
+            TypingEntry(
+              pubkey: 'carol',
+              expiresAtMs: DateTime.now().millisecondsSinceEpoch + 8000,
+            ),
+          ],
+          users: {
+            'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            'bob': const UserProfile(pubkey: 'bob', displayName: 'Bob'),
+            'carol': const UserProfile(pubkey: 'carol', displayName: 'Carol'),
+          },
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+
+      expect(find.byKey(const ValueKey('agent-typing-dot-2')), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('inline-agent-typing-alice')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('inline-agent-typing-bob')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('inline-agent-typing-carol')),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('keeps inline dots static when motion is reduced', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [],
+          typing: [
+            TypingEntry(
+              pubkey: 'alice',
+              expiresAtMs: DateTime.now().millisecondsSinceEpoch + 8000,
+            ),
+          ],
+          users: {
+            'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+          disableAnimations: true,
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.byKey(const ValueKey('agent-typing-dot-2')), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('channel-typing-shimmer')),
+        findsNothing,
+      );
+    });
   });
 
   group('Compose bar', () {
@@ -12482,9 +12626,7 @@ void main() {
         find.byType(FrostedAppBar).last,
       );
       expect(detailsAppBar.frosted, isFalse);
-      expect(detailsAppBar.frostedSurfaceOpacity, 0);
-      expect(detailsAppBar.frostedBlurSigma, 0);
-      expect(detailsAppBar.showBottomDivider, isFalse);
+
       expect(detailsAppBar.centerTitle, isTrue);
 
       final descriptionBottom = tester
@@ -12537,10 +12679,7 @@ void main() {
         find.byType(FrostedAppBar).last,
       );
       expect(detailsAppBar.frosted, isTrue);
-      expect(detailsAppBar.frostedSurfaceOpacity, 0.5);
-      expect(detailsAppBar.frostedBlurSigma, 20);
-      expect(detailsAppBar.showBottomDivider, isTrue);
-      expect(detailsAppBar.bottomDividerOpacity, 0.07);
+
       expect(
         tester
             .widget<AppListCard>(
@@ -15611,13 +15750,13 @@ void main() {
             if (initialHeadTop != null) {
               expect(tester.getTopLeft(head).dy, closeTo(initialHeadTop, 0.5));
             }
-            if (!layout.isMember || layout.isArchived) {
-              // As on desktop, a thread without a composer has no activity.
-              expect(
-                find.byKey(const ValueKey('conversation-activity')),
-                findsNothing,
-              );
-            }
+            expect(tester.getSize(list).height, closeTo(initialHeight, 0.5));
+            expect(
+              find.byKey(const ValueKey('typing-avatar-cluster')),
+              layout.isMember && !layout.isArchived
+                  ? findsOneWidget
+                  : findsNothing,
+            );
             typingNotifier.setEntries(const []);
             await tester.pumpAndSettle();
             expectTailWithinList();
@@ -18445,6 +18584,7 @@ class _MutableColorProfileNotifier extends ProfileNotifier {
 class _RecordingOrdinarySender implements SendMessage {
   final sent = <String>[];
   final channels = <Channel?>[];
+  final parents = <String?>[];
   @override
   Future<void> call({
     required String channelId,
@@ -18457,6 +18597,7 @@ class _RecordingOrdinarySender implements SendMessage {
   }) async {
     sent.add(content);
     channels.add(channel);
+    parents.add(parentEventId);
   }
 }
 
