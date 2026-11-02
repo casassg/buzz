@@ -313,9 +313,13 @@ enum Row {
     CoordinateDeletion,
     /// E3: kind:5 of a workflow in the archived channel.
     WorkflowDeletion,
+    /// The roster auto-join (invite claim, kind:9030): the shared self-join.
+    AutoJoin,
+    /// The admission auto-join of a community without a roster.
+    FirstJoin,
 }
 
-const ROWS: [Row; 21] = [
+const ROWS: [Row; 23] = [
     Row::Message,
     Row::Reaction,
     Row::CanvasHead,
@@ -337,6 +341,8 @@ const ROWS: [Row; 21] = [
     Row::SettingsEdit,
     Row::CoordinateDeletion,
     Row::WorkflowDeletion,
+    Row::AutoJoin,
+    Row::FirstJoin,
 ];
 
 enum Write {
@@ -344,6 +350,8 @@ enum Write {
     Addressable(Event, Uuid),
     Parameterized(Event, Uuid),
     Sink(Uuid),
+    SelfJoin(Vec<u8>, Uuid),
+    FirstJoin(Vec<u8>, Uuid),
 }
 
 struct Late {
@@ -501,6 +509,16 @@ async fn prepare(f: &Fixture, row: Row) -> Late {
             let delete = event(&owner, 5, "", &[&["a", &coordinate]]);
             (channel, client(delete), invalid(DELETION_DENIED), true)
         }
+        Row::AutoJoin => {
+            let joiner = Keys::generate().public_key().to_bytes().to_vec();
+            let write = Write::SelfJoin(joiner, channel);
+            (channel, write, invalid(ARCHIVED), true)
+        }
+        Row::FirstJoin => {
+            let joiner = Keys::generate().public_key().to_bytes().to_vec();
+            let write = Write::FirstJoin(joiner, channel);
+            (channel, write, invalid(ARCHIVED), true)
+        }
     };
     Late {
         archived,
@@ -560,16 +578,36 @@ async fn run(f: &Fixture, write: Write) -> Reply {
                 Err(e) => Reply::Other(e.to_string()),
             }
         }
+        Write::SelfJoin(pubkey, channel) => {
+            let joined = crate::handlers::side_effects::join_channel_as_self(
+                &f.tenant, &f.state, channel, &pubkey,
+            )
+            .await;
+            match joined {
+                Ok(_) => Reply::Applied,
+                Err(e) => match e.downcast::<DbError>() {
+                    Ok(e) => db_reply::<()>(Err(e)),
+                    Err(e) => Reply::Other(e.to_string()),
+                },
+            }
+        }
+        Write::FirstJoin(pubkey, channel) => db_reply(
+            f.state
+                .db
+                .put_first_member(community, channel, &pubkey)
+                .await,
+        ),
     }
 }
 
 /// A write that passed its unlocked checks before an archive committed is
 /// refused under the gate, and stores nothing: every refused kind, the
-/// store seams no client kind reaches, the command's first transaction and
-/// the workflow sink. A refused write waits for the gate shared. A
-/// settings-only kind:9002 (E1) takes no gate and is refused under the row
-/// lock. Mutations: drop the gate from a seam, or its archived re-read,
-/// and that row stores its write.
+/// store seams no client kind reaches, the command's first transaction, the
+/// workflow sink and both auto-join membership writes. A refused write waits
+/// for the gate shared. A settings-only kind:9002 (E1) takes no gate and is
+/// refused under the row lock. Mutations: drop the gate from a seam, or its
+/// archived re-read, and that row stores its write or waits on the row
+/// instead of the gate.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn late_writes_are_refused_by_a_concurrent_archive() {
@@ -580,7 +618,7 @@ async fn late_writes_are_refused_by_a_concurrent_archive() {
             Write::Client(_, event)
             | Write::Addressable(event, _)
             | Write::Parameterized(event, _) => Some(event.id),
-            Write::Sink(_) => None,
+            Write::Sink(_) | Write::SelfJoin(..) | Write::FirstJoin(..) => None,
         };
         let before = snapshot(&f).await;
         let gate = f.key(GATE, late.archived);

@@ -655,10 +655,10 @@ pub async fn add_member(
 /// neither a membership write nor a setting change can slip between the
 /// decision and the write.
 ///
-/// An archived channel admits nobody new: a target who is not an active
-/// member is refused with `AccessDenied` while `archived_at` is set. The
-/// archive state is read under the channel row lock, which every archive
-/// write needs too (see [`lock_channel_for_member_put`]).
+/// An archived channel refuses the write with `AccessDenied`: the channel's
+/// write gate comes first ([`ArchiveGate::Refuse`]). A target who is not an
+/// active member is refused again under the channel row lock, which every
+/// archive write needs too (see [`lock_channel_for_member_put`]).
 ///
 /// There is no creator exception: channel creation installs the creator as
 /// owner in the same transaction, so a creator without an active row was
@@ -727,9 +727,10 @@ pub async fn put_members(
     )
     .await?;
 
-    // First statements: serialize the whole decision / owner-count / upsert
-    // sequence against concurrent membership writes and archives of this
-    // channel.
+    // First statements: the channel's write gate, then the locks that
+    // serialize the whole decision / owner-count / upsert sequence against
+    // concurrent membership writes and archives of this channel.
+    crate::lifecycle::lock_write_gates(&mut tx, ArchiveGate::Refuse, &[channel_id]).await?;
     lock_channel_for_member_put(&mut tx, channel_id).await?;
     let results = put_members_on(&mut tx, channel_id, targets, invited_by).await?;
     tx.commit().await?;
@@ -823,6 +824,7 @@ pub async fn put_first_member(
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
+    crate::lifecycle::lock_write_gates(&mut tx, ArchiveGate::Refuse, &[channel_id]).await?;
     lock_channel_for_member_put(&mut tx, channel_id).await?;
     let seen: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM channel_members \
