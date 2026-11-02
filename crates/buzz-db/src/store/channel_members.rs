@@ -2409,9 +2409,10 @@ impl Db {
         lock_member_snapshot(&self.pool, community_id, channel_id, relay_pubkey).await
     }
 
-    /// Adds a member to a channel.
+    /// Adds a member to a channel. An archived channel refuses the write
+    /// (see [`put_member`]).
     ///
-    /// Ungated test fixture, no production caller: use [`Db::put_members_with_event`].
+    /// Test fixture, no production caller: use [`Db::put_members_with_event`].
     #[datastore_span(name = "add_member", system = "postgresql")]
     pub async fn add_member(
         &self,
@@ -2433,9 +2434,11 @@ impl Db {
     }
 
     /// Adds a member or changes a role, deciding the role from the request
-    /// and current channel state (see [`put_member`]).
+    /// and current channel state (see [`put_member`]). An archived channel
+    /// refuses the write.
     ///
-    /// Ungated test fixture, no production caller: use [`Db::put_members_with_event`].
+    /// The relay's default-channel auto-join calls this; command events use
+    /// [`Db::put_members_with_event`].
     #[datastore_span(name = "put_member", system = "postgresql")]
     pub async fn put_member(
         &self,

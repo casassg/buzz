@@ -7,7 +7,7 @@
 //! 1. community admission (the transaction begin);
 //! 2. task family locks, sorted by family root;
 //! 3. channel gates, sorted by channel: EXCLUSIVE for a writer that changes
-//!    archive state, SHARED for a write that [`ArchiveGate::Refuse`] guards;
+//!    archive state, SHARED for a write that [`crate::ArchiveGate::Refuse`] guards;
 //! 4. channel membership locks, sorted by channel;
 //! 5. channel TTL locks, sorted by channel;
 //! 6. channel rows, sorted by channel;
